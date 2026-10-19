@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}Backtests · NiftyPilot{% endblock %}
+{% block heading %}<h1>Historical backtests</h1><p>Follow three simple steps: download data, train the model, then replay option trades</p>{% endblock %}
+{% block content %}
+{% set model_score = model_metadata.get('balanced_accuracy', model_metadata.get('validation_accuracy', 0)) if model_metadata else 0 %}
+
+<section class="research-context">
+  <div><span>Execution broker</span><b>{{ active_broker }}</b><small>Used only for Paper and Live</small></div>
+  <div><span>Data and training source</span><b>{{ active_broker }}</b><small>One broker across the complete workflow</small></div>
+  <a class="button small secondary" href="/settings">Change broker</a>
+</section>
+
+<nav class="workflow-steps" aria-label="Backtest workflow">
+  <a href="#download-data"><span>1</span><div><b>Download data</b><small>Spot, futures and options</small></div></a>
+  <a href="#train-model"><span>2</span><div><b>Train model</b><small>One common XGBoost model</small></div></a>
+  <a href="#run-backtest"><span>3</span><div><b>Run backtest</b><small>Replay historical CE/PE trades</small></div></a>
+</nav>
+
+<div class="metrics three simple-readiness">
+  <article class="metric">
+    <span>Common model</span>
+    <strong class="mode-text {{ 'positive' if model_ready else 'negative' }}">{{ 'Available' if model_ready else 'Not trained' }}</strong>
+    <small>{% if model_ready %}{{ (model_score * 100)|round(1) }}% balanced validation · {{ model_metadata.version }}{% else %}Complete steps 1 and 2 before model backtests{% endif %}</small>
+  </article>
+  <article class="metric">
+    <span>Training candles</span>
+    <strong>{{ verified_futures }}</strong>
+    <small>Verified five-minute futures candles aligned with index data</small>
+  </article>
+  <article class="metric">
+    <span>Option replay candles</span>
+    <strong class="{{ 'positive' if verified_options else 'negative' }}">{{ verified_options }}</strong>
+    <small>{{ 'Ready for CE/PE replay checks' if verified_options else 'Required for trustworthy CE/PE profit and loss' }}</small>
+  </article>
+</div>
+
+<section class="card readiness-summary">
+  <div class="card-head"><div><h2>{{ active_broker }} data readiness</h2><span>Plain-language status for the active broker</span></div><span class="status blue">{{ active_broker }}</span></div>
+  <div class="readiness-cards">
+    {% for row in data_readiness %}{% if row.provider == active_broker %}
+    <article class="readiness-card">
+      <div class="readiness-title"><b>{{ row.underlying_code|replace('_',' ') }}</b><span class="status {{ 'green' if row.backtest_ready else ('blue' if row.training_ready else 'amber') }}">{{ 'BACKTEST READY' if row.backtest_ready else ('TRAINING READY' if row.training_ready else 'NOT READY') }}</span></div>
+      <dl>
+        <div><dt>Spot candles</dt><dd>{{ row.spot_count }}</dd></div>
+        <div><dt>Futures candles</dt><dd>{{ row.futures_count }}</dd></div>
+        <div><dt>Aligned candles</dt><dd>{{ row.aligned_count }} · {{ row.alignment_percent }}%</dd></div>
+        <div><dt>Option candles</dt><dd>{{ row.option_count }}</dd></div>
+      </dl>
+      {% if not row.backtest_ready %}<p>{{ row.reason }}</p>{% endif %}
+    </article>
+    {% endif %}{% endfor %}
+  </div>
+</section>
+
+<div class="grid-two research-tools">
+  <section id="download-data" class="card form-card workflow-card">
+    <div class="step-heading"><span>1</span><div><h2>Download historical data</h2><p>Get verified market candles and store them in SQLite.</p></div></div>
+    <form method="post" action="/backtests/sync-data" class="form-stack">
+      <input type="hidden" name="historical_provider" value="{{ active_broker }}">
+      <div class="selected-source"><span>Download from</span><b>{{ active_broker }}</b></div>
+      <fieldset><legend>Indices</legend><label class="check"><input type="checkbox" name="indices" value="NIFTY" checked>NIFTY 50</label><label class="check"><input type="checkbox" name="indices" value="BANK_NIFTY" checked>BANK NIFTY</label><label class="check"><input type="checkbox" name="indices" value="SENSEX" checked>SENSEX</label></fieldset>
+      <div class="form-grid"><label>From<input type="date" name="start_date" required></label><label>To<input type="date" name="end_date" required></label></div>
+      <label class="card-check check"><input type="checkbox" name="include_options" value="true"><span>Include expired options<small>Required for trustworthy historical CE/PE profit and loss.</small></span></label>
+      <details class="advanced-settings"><summary>Advanced download options</summary><label class="card-check check"><input type="checkbox" name="include_one_minute" value="true"><span>Include one-minute index candles<small>Used only when stop and target occur inside the same five-minute candle.</small></span></label></details>
+      <button class="button secondary">Download data</button>
+    </form>
+  </section>
+
+  <section id="train-model" class="card form-card workflow-card">
+    <div class="step-heading"><span>2</span><div><h2>Train the model</h2><p>Uses aligned spot and futures candles. Options are not needed here.</p></div></div>
+    <form method="post" action="/backtests/train" class="form-stack">
+      <input type="hidden" name="historical_provider" value="{{ active_broker }}">
+      <div class="selected-source"><span>Train using</span><b>Stored {{ active_broker }} data</b></div>
+      <fieldset><legend>Training indices</legend><label class="check"><input type="checkbox" name="indices" value="NIFTY" checked>NIFTY</label><label class="check"><input type="checkbox" name="indices" value="BANK_NIFTY" checked>BANK NIFTY</label><label class="check"><input type="checkbox" name="indices" value="SENSEX" checked>SENSEX</label></fieldset>
+      <div class="form-grid"><label>Training from<input type="date" name="start_date" required></label><label>Training to<input type="date" name="end_date" required></label></div>
+      <div class="notice">Training creates a candidate model. Review its validation result below before activating it.</div>
+      <button class="button primary">Train candidate model</button>
+    </form>
+  </section>
+</div>
+
+<details class="card disclosure-card" {% if research_runs and research_runs[0].status in ['QUEUED','RUNNING'] %}open{% endif %}>
+  <summary><span><b>Download activity</b><small>Progress and recently completed research downloads</small></span><em>{{ research_runs|length }} recent</em></summary>
+  <div class="disclosure-content"><div class="run-list">{% for run in research_runs %}{% include "partials/research_status.html" %}{% else %}<div class="empty-state compact">No downloads submitted.</div>{% endfor %}</div></div>
+</details>
+
+<details class="card disclosure-card">
+  <summary><span><b>Model history and diagnostics</b><small>Candidate quality, activation and technical details</small></span><em>{{ model_artifacts|length }} models</em></summary>
+  <div class="disclosure-content table-wrap"><table><thead><tr><th>Model</th><th>Training period</th><th>Samples</th><th>Balanced validation</th><th>Predictions ≥70%</th><th>Status</th><th></th></tr></thead><tbody>{% for artifact in model_artifacts %}{% set detail = model_details[artifact.id] %}<tr><td><b>{{ artifact.version }}</b><small>{{ detail.get('feature_schema','') }}</small><details><summary>Technical diagnostics</summary><small><b>Confusion matrix:</b> {{ detail.get('confusion_matrix',[]) }}</small>{% for name,values in detail.get('per_class_metrics',{}).items() %}<small>{{ name }} · precision {{ (values.precision * 100)|round(1) }}% · recall {{ (values.recall * 100)|round(1) }}%</small>{% endfor %}{% for fold in detail.get('walk_forward_validation',[]) %}<small><b>Walk-forward:</b> {{ fold.training_end[:10] }} → {{ fold.validation_end[:10] }} · {{ (fold.balanced_accuracy * 100)|round(1) }}% balanced</small>{% endfor %}<small><b>Feature gain:</b> {{ detail.get('feature_importance',{}) }}</small></details></td><td>{{ detail.get('training_data_provider','') }}<small>{{ detail.get('training_start','') }} → {{ detail.get('training_end','') }}</small></td><td>{{ detail.get('samples',0) }}</td><td>{{ (detail.get('balanced_accuracy',0) * 100)|round(1) }}%</td><td>{{ detail.get('validation_confidence',{}).get('above_70_percent',0) }}%</td><td><span class="status {{ 'green' if artifact.status == 'ACTIVE' else ('blue' if artifact.status == 'CANDIDATE' else 'muted') }}">{{ artifact.status }}</span></td><td>{% if artifact.status != 'ACTIVE' and artifact.status != 'PRUNED' %}<form method="post" action="/backtests/models/{{ artifact.id }}/activate"><button class="button small primary">Activate</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="7" class="empty-row">No candidate models yet.</td></tr>{% endfor %}</tbody></table></div>
+</details>
+
+<div id="run-backtest" class="grid-form backtest-run-area">
+  <section class="card form-card workflow-card">
+    <div class="step-heading"><span>3</span><div><h2>Run a backtest</h2><p>Choose the period after model training and replay real option candles.</p></div></div>
+    <form method="post" action="/backtests" class="form-stack">
+      <fieldset><legend>Indices</legend><label class="check"><input type="checkbox" name="indices" value="NIFTY" checked>NIFTY 50</label><label class="check"><input type="checkbox" name="indices" value="BANK_NIFTY" checked>BANK NIFTY</label><label class="check"><input type="checkbox" name="indices" value="SENSEX" checked>SENSEX</label></fieldset>
+      <div class="form-grid">
+        <label>Backtest from<input type="date" name="start_date" required></label><label>Backtest to<input type="date" name="end_date" required></label>
+        <label>Strategy<select name="strategy_mode"><option value="MODEL">Active XGBoost model</option><option value="RULE_ONLY">Rule-only comparison</option></select></label>
+        <label>Strike selection<select name="strike_policy"><option value="ATM_ITM1">ATM, then ITM1 fallback</option><option value="ATM_ONLY">ATM only</option></select></label>
+        <label>Starting capital<input type="number" name="capital" value="500000" min="10000" step="1000"></label>
+      </div>
+      <details class="advanced-settings"><summary>Advanced backtest settings</summary><div class="form-grid advanced-grid">
+        <input type="hidden" name="historical_provider" value="{{ active_broker }}">
+        {% if active_broker == 'UPSTOX' %}<label>Upstox charge calculation<select name="cost_model"><option value="UPSTOX">Upstox Basic</option><option value="UPSTOX_PLUS">Upstox Plus</option></select></label>{% else %}<input type="hidden" name="cost_model" value="GROWW">{% endif %}
+        <label>Risk per trade %<input type="number" name="risk_pct" value="0.25" min="0.01" max="2" step="0.01"></label>
+        <label>Slippage per side %<input type="number" name="slippage_pct" value="0.05" min="0" step="0.01"></label>
+        <label>Entry delay (bars)<input type="number" name="entry_delay_bars" value="1" min="1" max="6"></label>
+        <label>Minimum option volume<input type="number" name="minimum_option_volume" value="1" min="0"></label>
+        <label>Maximum spread %<input type="number" name="maximum_spread_pct" value="1.5" min="0.1" step="0.1"></label>
+      </div></details>
+      <div class="notice">A model backtest needs an active model. Every backtest needs verified historical option candles; synthetic premiums are never used.</div>
+      <button class="button primary">Run backtest</button>
+    </form>
+  </section>
+  <section class="card"><div class="card-head"><h2>Recent runs</h2><span>One at a time</span></div><div class="run-list">{% for run in runs %}<a href="/backtests?run_id={{ run.id }}#backtest-result" class="run-item {{ 'active' if selected and selected.id == run.id }}"><div><b>#{{ run.id }} · {{ run.start_date }} to {{ run.end_date }}</b><small>{{ run_details[run.id].get('historical_provider', 'UPSTOX') }} data · {{ run_details[run.id].get('cost_model', 'UPSTOX') }} costs</small></div><span class="status {{ 'green' if run.status == 'COMPLETE' else ('red' if run.status == 'FAILED' else 'amber') }}">{{ run.status }}</span></a>{% else %}<div class="empty-state compact"><p>No backtests have been submitted.</p></div>{% endfor %}</div></section>
+</div>
+
+<details class="card disclosure-card">
+  <summary><span><b>Advanced data diagnostics</b><small>All providers, missing bars and historical contract metadata</small></span><em>For troubleshooting</em></summary>
+  <div class="disclosure-content">
+    <div class="table-wrap"><table><thead><tr><th>Provider / index</th><th>Spot</th><th>Futures</th><th>Aligned</th><th>Options</th><th>Contract metadata</th><th>Quality</th><th>Ready</th></tr></thead><tbody>{% for row in data_readiness %}{% if row.spot_count or row.futures_count or row.option_count %}<tr><td><b>{{ row.provider }}</b><small>{{ row.underlying_code|replace('_',' ') }} · {{ row.first_timestamp or '—' }} → {{ row.last_timestamp or '—' }}</small></td><td>{{ row.spot_count }}<small>{{ row.zero_volume_percent }}% zero volume</small></td><td>{{ row.futures_count }}</td><td>{{ row.aligned_count }}<small>{{ row.alignment_percent }}%</small></td><td>{{ row.option_count }}</td><td>{{ row.verified_contracts }} verified<small>{{ row.pending_contracts }} pending</small></td><td>{{ row.missing_intervals }} missing bars</td><td><span class="status {{ 'green' if row.backtest_ready else ('blue' if row.training_ready else 'amber') }}">{{ 'BACKTEST' if row.backtest_ready else ('TRAINING' if row.training_ready else 'NOT READY') }}</span><small>{{ row.reason }}</small></td></tr>{% endif %}{% else %}<tr><td colspan="8" class="empty-row">No research candles downloaded.</td></tr>{% endfor %}</tbody></table></div>
+    <hr>
+    <div class="metadata-tools"><div><h3>Historical contract metadata</h3><p class="hint">Import only lot size and tick size verified from an exchange or broker archive. NiftyPilot never guesses historical lot sizes.</p></div><form method="post" action="/backtests/contract-metadata" enctype="multipart/form-data" class="metadata-form"><label>Completed metadata CSV<input type="file" name="metadata_file" accept=".csv,text/csv" required></label><div class="button-row"><a class="button small secondary" href="/backtests/contract-metadata.csv">Export pending CSV</a><button class="button secondary">Import verified CSV</button></div></form></div>
+  </div>
+</details>
+
+{% if selected %}{% include "partials/backtest_result.html" %}{% endif %}
+{% endblock %}

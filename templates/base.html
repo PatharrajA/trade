@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}NiftyPilot{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+  <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/overview"><span class="logo">⌁</span><span>NiftyPilot</span></a>
+    <nav>
+      <a class="nav-item {% if active == 'overview' %}active{% endif %}" href="/overview"><span>▦</span>Overview</a>
+      <a class="nav-item {% if active == 'orders' %}active{% endif %}" href="/orders"><span>⇄</span>Orders</a>
+      <a class="nav-item {% if active == 'backtests' %}active{% endif %}" href="/backtests"><span>♙</span>Backtests</a>
+      <a class="nav-item {% if active == 'telegram' %}active{% endif %}" href="/telegram"><span>➤</span>Telegram</a>
+      <a class="nav-item {% if active == 'settings' %}active{% endif %}" href="/settings"><span>⚙</span>Settings</a>
+    </nav>
+    <div class="side-health">
+      <div><i class="dot {{ 'ok' if db_ok|default(true) else 'bad' }}"></i>Database</div>
+      <div><i class="dot {{ 'ok' if runtime_error is not defined or not runtime_error else 'bad' }}"></i>Trading service</div>
+      <div><i class="dot {{ 'ok' if settings is defined and settings.get('telegram_enabled') == 'true' else 'muted' }}"></i>Telegram</div>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div>{% block heading %}{% endblock %}</div>
+      <div class="profile"><span>Personal</span><b>NP</b></div>
+    </header>
+    {% if message %}<div class="flash {{ 'success' if message_ok else 'error' }}">{{ message }}</div>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

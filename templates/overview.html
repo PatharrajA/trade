@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}Overview · NiftyPilot{% endblock %}
+{% block heading %}<h1>Trading overview</h1><p>Profit, risk and execution status in one place</p>{% endblock %}
+{% block content %}
+<section class="mode-card">
+  <div class="mode-copy"><span class="shield">◇</span><div><h3>{{ 'Paper trading active' if runtime.execution_mode == 'PAPER' else ('Live trading active' if runtime.execution_mode == 'LIVE' else 'Trading stopped') }}</h3><p>{{ active_broker }} · {{ 'live prices · simulated orders · virtual capital' if runtime.execution_mode == 'PAPER' else ('real broker orders · one live lot maximum' if runtime.execution_mode == 'LIVE' else 'signals and orders are paused') }}</p></div></div>
+  <form class="mode-switch" method="post" action="/mode">
+    <button name="target" value="STOPPED" class="{{ 'selected' if runtime.execution_mode == 'STOPPED' }}">Stopped</button>
+    <button name="target" value="PAPER" class="{{ 'selected' if runtime.execution_mode == 'PAPER' }}">Paper</button>
+    <button type="button" class="danger {{ 'selected' if runtime.execution_mode == 'LIVE' }}" onclick="document.getElementById('live-confirm').showModal()">Live</button>
+  </form>
+</section>
+<div class="notice paper-validation {{ 'error' if not enforce_paper_sessions }}">
+  {% if enforce_paper_sessions %}<b>Paper validation: {{ paper_sessions }} / {{ required_paper_sessions }} sessions.</b> {{ remaining_paper_sessions ~ ' more required before Live.' if remaining_paper_sessions else 'Paper-session requirement passed.' }}
+  {% else %}<b>Paper validation is not enforced.</b> All other Live preflight checks still apply.{% endif %}
+</div>
+{% if runtime.execution_mode != 'STOPPED' and not runtime.entries_paused %}<form method="post" action="/entries/pause" class="inline-action"><button class="button secondary">Pause new entries</button><small>Open positions continue to be monitored.</small></form>{% endif %}
+
+<div class="metrics four pnl-kpis">
+  <article class="metric"><span>Today net P&amp;L</span><strong class="{{ 'positive' if today_pnl >= 0 else 'negative' }}">{{ today_pnl|money }}</strong><small>{{ today_trades }} closed trade{{ '' if today_trades == 1 else 's' }}</small></article>
+  <article class="metric"><span>Open P&amp;L</span><strong class="{{ 'positive' if open_pnl >= 0 else 'negative' }}">{{ open_pnl|money }}</strong><small>Valued using executable bid</small></article>
+  <article class="metric"><span>Month net P&amp;L</span><strong class="{{ 'positive' if month_pnl >= 0 else 'negative' }}">{{ month_pnl|money }}</strong><small>Gross {{ month_gross_pnl|money }} − ₹{{ month_charges|round(2) }} costs</small></article>
+  <article class="metric"><span>Capital return</span><strong class="{{ 'positive' if capital_return >= 0 else 'negative' }}">{{ '%+.2f'|format(capital_return) }}%</strong><small>On ₹{{ settings.paper_capital }} configured capital</small></article>
+</div>
+
+<div class="metrics four quality-kpis">
+  <article class="metric compact"><span>Trades this month</span><strong>{{ month_trade_count }}</strong><small>{{ trades_remaining }} remaining today</small></article>
+  <article class="metric compact"><span>Win rate</span><strong>{{ win_rate|round(1) }}%</strong><small>Closed trades this month</small></article>
+  <article class="metric compact"><span>Profit factor</span><strong>{{ profit_factor|round(2) if profit_factor is not none else '—' }}</strong><small>Gross wins ÷ gross losses</small></article>
+  <article class="metric compact"><span>Max drawdown</span><strong class="negative">{{ maximum_drawdown|money }}</strong><small>Month realized equity curve</small></article>
+</div>
+
+<div class="grid-two main-grid">
+  <section class="card chart-card">
+    <div class="card-head"><div><h2>Month performance</h2><span>Realized closed-trade equity</span></div><span>{{ month_pnl|money }}</span></div>
+    <div class="empty-chart"><svg viewBox="0 0 700 230" role="img" aria-label="Month realized profit and loss curve"><line x1="10" y1="110" x2="690" y2="110" stroke="#e7ebf3" stroke-dasharray="5 5"/><polyline points="{{ equity_points }}" fill="none" stroke="#5869ee" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/></svg><p>{{ 'No closed trades this month.' if month_trade_count == 0 else 'Net P&L after brokerage, taxes and slippage.' }}</p></div>
+  </section>
+  <section class="card position-card">
+    <div class="card-head"><h2>Open position</h2><span>{{ last_tick.strftime('%H:%M:%S') if last_tick else 'No live tick' }}</span></div>
+    {% if open_trade %}
+      <div class="position-title"><div><h3>{{ open_trade.trading_symbol }}</h3><div class="chips"><span>{{ open_trade.option_type }}</span><span>{{ open_trade.moneyness }}</span><span>{{ open_trade.expiry }}</span><span>{{ open_trade.quantity // open_trade.lot_size }} lot</span></div></div><strong class="{{ 'positive' if open_pnl >= 0 else 'negative' }}">{{ open_pnl|money }}</strong></div>
+      <dl class="details"><dt>Entry</dt><dd>₹{{ open_trade.entry_price }}</dd><dt>Current bid</dt><dd>₹{{ open_trade.current_bid or '—' }}</dd><dt>Index stop</dt><dd>{{ open_trade.underlying_stop }}</dd><dt>Index target</dt><dd>{{ open_trade.underlying_target }}</dd><dt>Emergency premium stop</dt><dd>₹{{ open_trade.premium_emergency_stop }}</dd><dt>Risk budget</dt><dd>{{ (open_trade.risk_budget or 0)|money }}</dd></dl>
+      <form method="post" action="/trades/{{ open_trade.id }}/exit" class="manual-exit"><label>{% if open_trade.mode == 'LIVE' %}Type <b>EXIT NOW</b> to close the real position<input name="confirmation" required autocomplete="off">{% else %}<input type="hidden" name="confirmation" value="EXIT NOW">Close the simulated position at the current executable bid{% endif %}</label><button class="button red">Exit {{ open_trade.mode }} position</button></form>
+    {% else %}<div class="empty-state"><span>◎</span><h3>No open position</h3><p>The strategy is waiting for model confidence, rule alignment and a liquid ATM/ITM1 contract.</p></div>{% endif %}
+  </section>
+</div>
+
+<div class="grid-two insight-grid">
+  <section class="card">
+    <div class="card-head"><h2>Risk status</h2><span>Today</span></div>
+    <div class="risk-meter"><div><b>{{ risk_usage_percent|round(1) }}% used</b><span>{{ remaining_daily_risk|money }} remaining</span></div><div class="progress"><i style="width:{{ risk_usage_percent }}%"></i></div></div>
+    <dl class="details"><dt>Daily loss budget</dt><dd>{{ daily_loss_budget|money }}</dd><dt>Open trade risk</dt><dd>{{ open_risk|money }}</dd><dt>Trades remaining</dt><dd>{{ trades_remaining }}</dd><dt>Consecutive losses</dt><dd>{{ consecutive_losses }} / {{ settings.max_consecutive_losses }}</dd></dl>
+  </section>
+  <section class="card">
+    <div class="card-head"><h2>Trade quality</h2><span>This month</span></div>
+    <div class="quality-grid"><div><span>Average win</span><b class="positive">{{ average_win|money }}</b></div><div><span>Average loss</span><b class="negative">{{ average_loss|money }}</b></div><div><span>Expectancy / trade</span><b class="{{ 'positive' if expectancy >= 0 else 'negative' }}">{{ expectancy|money }}</b></div><div><span>Average holding</span><b>{{ average_holding_minutes }} min</b></div><div><span>Largest win</span><b class="positive">{{ largest_win|money }}</b></div><div><span>Largest loss</span><b class="negative">{{ largest_loss|money }}</b></div></div>
+  </section>
+</div>
+
+<section class="card performance-breakdown">
+  <div class="card-head"><div><h2>Performance breakdown</h2><span>Find which index, direction and strike policy produces the result</span></div><span>This month</span></div>
+  <div class="breakdown-grid">
+    <div><h3>By index</h3><div class="table-wrap"><table><thead><tr><th>Index</th><th>Net P&amp;L</th><th>Trades</th><th>Win rate</th></tr></thead><tbody>{% for code, row in per_index.items() %}<tr><td><b>{{ code|replace('_',' ') }}</b></td><td class="{{ 'positive' if row.pnl >= 0 else 'negative' }}">{{ row.pnl|money }}</td><td>{{ row.trades }}</td><td>{{ row.win_rate|round(1) }}%</td></tr>{% endfor %}</tbody></table></div></div>
+    <div><h3>CE versus PE</h3>{% for name, row in option_breakdown.items() %}<div class="stat-row"><span>{{ name }} · {{ row.trades }} trades</span><b class="{{ 'positive' if row.pnl >= 0 else 'negative' }}">{{ row.pnl|money }}</b></div>{% endfor %}</div>
+    <div><h3>ATM versus ITM1</h3>{% for name, row in moneyness_breakdown.items() %}<div class="stat-row"><span>{{ name }} · {{ row.trades }} trades</span><b class="{{ 'positive' if row.pnl >= 0 else 'negative' }}">{{ row.pnl|money }}</b></div>{% endfor %}</div>
+  </div>
+</section>
+
+<div class="grid-two">
+  <section class="card"><div class="card-head"><h2>Daily P&amp;L</h2><span>Current month</span></div><div class="pnl-calendar">{% for day in calendar_days %}<div class="{{ 'gain' if daily_pnl.get(day, 0) > 0 else ('loss' if daily_pnl.get(day, 0) < 0 else '') }}"><span>{{ day }}</span><b>{{ daily_pnl.get(day, 0)|money if daily_pnl.get(day) else '—' }}</b></div>{% endfor %}</div></section>
+  <section class="card"><div class="card-head"><h2>Exit reasons</h2><span>This month</span></div>{% for name, row in exit_breakdown.items() %}<div class="stat-row"><span>{{ name|replace('_',' ')|title }} · {{ row.trades }}</span><b class="{{ 'positive' if row.pnl >= 0 else 'negative' }}">{{ row.pnl|money }}</b></div>{% else %}<div class="empty-state compact">No closed trades this month.</div>{% endfor %}</section>
+</div>
+
+<section class="card"><div class="card-head"><h2>Recent closed trades</h2><a class="button small secondary" href="/orders">View all orders</a></div><div class="table-wrap"><table><thead><tr><th>Exit time</th><th>Index</th><th>Contract</th><th>Entry → Exit</th><th>Gross</th><th>Costs</th><th>Net P&amp;L</th><th>Reason</th></tr></thead><tbody>{% for trade in recent_closed_trades %}<tr><td>{{ trade.exit_time.strftime('%d %b %H:%M') if trade.exit_time else '—' }}</td><td>{{ trade.underlying_code|replace('_',' ') }}</td><td><b>{{ trade.option_type }} · {{ trade.moneyness }}</b><small>{{ trade.trading_symbol }}</small></td><td>₹{{ trade.entry_price }} → ₹{{ trade.exit_price }}</td><td>{{ trade.gross_pnl|money }}</td><td>₹{{ trade.charges }}</td><td class="{{ 'positive' if trade.net_pnl >= 0 else 'negative' }}"><b>{{ trade.net_pnl|money }}</b></td><td>{{ (trade.exit_reason or 'Unknown')|replace('_',' ')|title }}</td></tr>{% else %}<tr><td colspan="8" class="empty-row">No closed trades this month.</td></tr>{% endfor %}</tbody></table></div></section>
+
+<dialog id="live-confirm"><form method="post" action="/mode" class="dialog-form"><input type="hidden" name="target" value="LIVE"><h2>Enable {{ active_broker }} live trading</h2><p>This can place real {{ active_broker }} orders. Broker, database, static-IP and position preflight checks must pass.</p><label>Type <b>LIVE TRADING</b><input name="confirmation" autocomplete="off" required></label><div class="dialog-actions"><button type="button" class="button secondary" onclick="this.closest('dialog').close()">Cancel</button><button class="button red">Run preflight &amp; enable</button></div></form></dialog>
+{% endblock %}

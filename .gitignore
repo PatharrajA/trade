@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/backups/
+data/secrets/
+models/*.json

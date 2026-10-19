@@ -1,0 +1,24 @@
+[Unit]
+Description=NiftyPilot index-options trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=niftypilot
+Group=niftypilot
+WorkingDirectory=/opt/niftypilot
+EnvironmentFile=/opt/niftypilot/.env
+ExecStart=/opt/niftypilot/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/niftypilot/data /opt/niftypilot/models
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

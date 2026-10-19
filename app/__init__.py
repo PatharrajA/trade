@@ -1,0 +1,2 @@
+"""NiftyPilot application package."""
+

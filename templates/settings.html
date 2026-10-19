@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Settings · NiftyPilot{% endblock %}
+{% block heading %}<h1>Settings &amp; system</h1><p>Use one active execution broker and one common, provider-neutral model</p>{% endblock %}
+{% block content %}
+<div class="health-strip">
+  {% if active_broker == 'UPSTOX' %}
+  <div><i class="dot {{ 'ok' if analytics_ok else 'bad' }}"></i><span>Upstox market data</span><b>{{ analytics_detail }}</b></div>
+  <div><i class="dot {{ 'ok' if trading_ok else 'bad' }}"></i><span>Upstox live orders</span><b>{{ trading_detail }}</b></div>
+  {% else %}
+  <div><i class="dot {{ 'ok' if groww_ok else 'bad' }}"></i><span>Groww market &amp; orders</span><b>{{ groww_detail }}</b></div>
+  {% endif %}
+  <div><i class="dot {{ 'ok' if db_ok else 'bad' }}"></i><span>SQLite</span><b>{{ db_detail }}</b></div>
+  <div><i class="dot {{ 'ok' if backup.ok else 'bad' }}"></i><span>Nightly backup</span><b>{{ backup.detail }}</b></div>
+  <div><i class="dot {{ 'ok' if permissions_ok else 'bad' }}"></i><span>Secret files</span><b>{{ permissions_detail }}</b></div>
+  <div><i class="dot {{ 'ok' if not runtime_error else 'bad' }}"></i><span>Trading loop</span><b>{{ runtime_error or 'Healthy' }}</b></div>
+</div>
+
+<div class="grid-two">
+  <section class="card form-card">
+    <div class="card-head"><h2>Execution broker</h2><span class="status blue">{{ active_broker }} ACTIVE</span></div>
+    <p class="hint">Choose which broker receives live prices and orders. This does not change or delete stored research data.</p>
+    <form method="post" action="/settings/broker" class="form-stack">
+      <div class="broker-choices" role="radiogroup" aria-label="Paper and live execution broker">
+        <label class="broker-choice {{ 'selected' if active_broker == 'UPSTOX' }}">
+          <input type="radio" name="active_broker" value="UPSTOX" {{ 'checked' if active_broker == 'UPSTOX' }}>
+          <span><b>Upstox</b><small>Recommended for your Paper and Live trading</small></span>
+          {% if active_broker == 'UPSTOX' %}<em>Active</em>{% endif %}
+        </label>
+        <label class="broker-choice {{ 'selected' if active_broker == 'GROWW' }}">
+          <input type="radio" name="active_broker" value="GROWW" {{ 'checked' if active_broker == 'GROWW' }}>
+          <span><b>Groww</b><small>Use only if you want Groww to execute trades</small></span>
+          {% if active_broker == 'GROWW' %}<em>Active</em>{% endif %}
+        </label>
+      </div>
+      <div class="notice">The active broker is used for live prices, paper trading, research downloads, model training and backtests. Existing stored data is not deleted.</div>
+      <div class="notice">To change broker: switch execution to Stopped, close any open position and resolve pending orders.</div>
+      <button class="button primary">Save execution broker</button>
+    </form>
+  </section>
+  <section class="card form-card">
+    {% if active_broker == 'GROWW' %}
+      <div class="card-head"><h2>Groww connection</h2><span class="status {{ 'green' if groww_ok else 'red' }}">{{ 'CONNECTED' if groww_ok else 'REQUIRED' }}</span></div>
+      <p class="hint">One Groww token is used for historical data, Paper prices and Live orders. It expires daily at 6:00 AM.</p>
+      <form method="post" action="/settings/groww-token" class="form-stack">
+        <label>Groww Access Token<input type="password" name="token" placeholder="Paste Groww Trading API token" required></label>
+        <div class="notice {{ 'success' if groww_ok else '' }}">{{ 'Groww API access is verified.' if groww_ok else 'An active Groww Trading API subscription is required.' }}</div>
+        <button class="button primary">Verify &amp; save Groww token</button>
+      </form>
+    {% else %}
+      <div class="card-head"><h2>Upstox connection</h2><span class="status {{ 'green' if analytics_ok else 'red' }}">{{ 'MARKET READY' if analytics_ok else 'SETUP REQUIRED' }}</span></div>
+      <p class="hint">The Analytics token supplies market data. The daily Trading token is needed only when you enable Live.</p>
+      <form method="post" action="/settings/analytics-token" class="form-stack token-form">
+        <label>Analytics Token<input type="password" name="token" placeholder="Paste the one-year Analytics Token" required></label>
+        <button class="button primary">Verify &amp; save analytics token</button>
+      </form>
+      <hr class="section-divider">
+      <form method="post" action="/settings/trading-token" class="form-stack token-form">
+        <label>Daily Trading Token<input type="password" name="token" placeholder="Paste token only for Live trading" required></label>
+        <div class="notice {{ 'success' if trading_ok else '' }}">{% if trading_ok %}Expected cutoff: {{ trading_expiry.strftime('%d %b %Y, %I:%M %p IST') }}.{% else %}Paper and Backtest do not require this token.{% endif %}</div>
+        <button class="button secondary">Verify &amp; save trading token</button>
+      </form>
+    {% endif %}
+  </section>
+</div>
+
+<section class="card"><div class="card-head"><h2>Common XGBoost model</h2><span class="status {{ 'green' if model_metadata else 'amber' }}">{{ 'READY' if model_metadata else 'NOT TRAINED' }}</span></div>{% if model_metadata %}<dl class="details"><dt>Version</dt><dd>{{ model_metadata.version }}</dd><dt>Training source</dt><dd>{{ model_metadata.get('training_data_provider', model_metadata.get('provider', 'Unknown')) }}</dd><dt>Feature schema</dt><dd>{{ model_metadata.get('feature_schema', 'Legacy — retrain required') }}</dd><dt>Compatible live feeds</dt><dd>{{ model_metadata.get('compatible_live_providers', [])|join(', ') }}</dd></dl>{% else %}<p class="hint">Download verified spot and futures history, then train from the Backtests screen. Only one active model is stored.</p>{% endif %}</section>
+
+<div class="grid-two">
+  <section class="card form-card">
+    <h2>Enabled indices</h2>
+    <form method="post" action="/settings/markets" class="form-stack">
+      <label class="check card-check"><input type="checkbox" name="indices" value="NIFTY" {{ 'checked' if 'NIFTY' in enabled_indices }}>NIFTY 50 <small>NSE index options</small></label>
+      <label class="check card-check"><input type="checkbox" name="indices" value="BANK_NIFTY" {{ 'checked' if 'BANK_NIFTY' in enabled_indices }}>BANK NIFTY <small>NSE index options</small></label>
+      <label class="check card-check"><input type="checkbox" name="indices" value="SENSEX" {{ 'checked' if 'SENSEX' in enabled_indices }}>SENSEX <small>BSE index options</small></label>
+      <button class="button primary">Save indices</button>
+    </form>
+  </section>
+
+  <section class="card form-card">
+    <h2>Broker operations</h2>
+    <p class="hint">Instrument refresh and reconciliation use only {{ active_broker }}. Inactive-broker credentials are intentionally hidden.</p>
+    <div class="button-row"><form method="post" action="/settings/refresh-instruments"><input type="hidden" name="provider" value="{{ active_broker }}"><button class="button secondary">Refresh {{ active_broker }} instruments</button></form><form method="post" action="/settings/reconcile"><button class="button secondary">Reconcile live positions</button></form></div>
+    <dl class="details"><dt>Contract versions</dt><dd>{{ instrument_count }}</dd><dt>Last candle</dt><dd>{{ last_candle or 'Not synced' }}</dd><dt>Paper available</dt><dd>{{ 'Yes' if active_market_ok else 'No' }}</dd><dt>Live available</dt><dd>{{ 'Preflight ready' if active_market_ok and active_trading_ok else 'No' }}</dd></dl>
+  </section>
+</div>
+
+<section class="card form-card"><div class="card-head"><h2>Risk settings</h2><span>Shared by paper and live</span></div><form method="post" action="/settings/risk" class="form-grid risk-form"><label>Capital (₹)<input type="number" name="paper_capital" value="{{ settings.paper_capital }}" min="10000" step="1000"></label><label>Risk per trade %<input type="number" name="risk_per_trade_pct" value="{{ settings.risk_per_trade_pct }}" step="0.01"></label><label>Daily loss limit %<input type="number" name="daily_loss_limit_pct" value="{{ settings.daily_loss_limit_pct }}" step="0.01"></label><label>Max trades / day<input type="number" name="max_trades_per_day" value="{{ settings.max_trades_per_day }}" min="1"></label><label>Consecutive loss limit<input type="number" name="max_consecutive_losses" value="{{ settings.max_consecutive_losses }}" min="1"></label><label>Premium emergency stop %<input type="number" name="premium_emergency_stop_pct" value="{{ settings.premium_emergency_stop_pct }}" step="1"></label><label>Reward / risk target<input type="number" name="reward_risk" value="{{ settings.reward_risk }}" step="0.1"></label><label>Paper slippage / side %<input type="number" name="paper_slippage_pct" value="{{ settings.paper_slippage_pct }}" step="0.01"></label><div class="risk-explain"><b>How stops and targets work</b><p>The AI predicts regime, direction and confidence. Stop uses index ATR/structure; target is calculated from the configured reward/risk ratio. The option premium has a separate emergency stop.</p></div><button class="button primary">Save risk settings</button></form></section>
+<section class="card form-card">
+  <div class="card-head"><h2>Live safety gate</h2><span>{{ paper_sessions }} completed paper sessions</span></div>
+  <form method="post" action="/settings/live-safety" class="form-grid">
+    <label class="check card-check">
+      <input id="paper-session-toggle" type="checkbox" name="enforce_paper_session_requirement" value="true" {{ 'checked' if settings.enforce_paper_session_requirement == 'true' }} onchange="document.getElementById('paper-session-count').disabled = !this.checked">
+      <span>Require Paper sessions before Live<small>Recommended safety check. Disable it to skip only this requirement.</small></span>
+    </label>
+    <label>Required completed sessions
+      <input type="hidden" id="paper-session-value" name="required_paper_sessions" value="{{ settings.required_paper_sessions }}">
+      <input id="paper-session-count" type="number" value="{{ settings.required_paper_sessions }}" min="0" max="60" {{ 'disabled' if settings.enforce_paper_session_requirement != 'true' }} oninput="document.getElementById('paper-session-value').value = this.value">
+      <small>{% if settings.enforce_paper_session_requirement == 'true' %}{{ remaining_paper_sessions }} remaining{% else %}Saved value retained; requirement currently disabled{% endif %}</small>
+    </label>
+    <label class="check card-check"><input type="checkbox" name="static_ip_verified" value="true" {{ 'checked' if settings.static_ip_verified == 'true' }}><span>Static IP verified with broker<small>This is a manual acknowledgement; broker, token, database and position checks still run.</small></span></label>
+    <div class="notice {{ 'error' if settings.enforce_paper_session_requirement != 'true' }}">{% if settings.enforce_paper_session_requirement == 'true' %}Live requires {{ settings.required_paper_sessions }} completed Paper sessions. The model, feed, token, static-IP and reconciliation checks also remain compulsory.{% else %}<b>Paper-session safety gate is disabled.</b> Live can start with zero Paper sessions, but every other Live preflight check remains compulsory.{% endif %}</div>
+    <button class="button primary">Save live gate</button>
+  </form>
+</section>
+<section class="card"><div class="card-head"><h2>Recent system events</h2><span>Latest 30</span></div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Severity</th><th>Component</th><th>Event</th><th>Message</th></tr></thead><tbody>{% for e in events %}<tr><td>{{ e.created_at }}</td><td><span class="status {{ 'red' if e.severity in ['ERROR','CRITICAL'] else 'blue' }}">{{ e.severity }}</span></td><td>{{ e.component }}</td><td>{{ e.event_type }}</td><td>{{ e.message }}</td></tr>{% else %}<tr><td colspan="5" class="empty-row">No system events.</td></tr>{% endfor %}</tbody></table></div></section>
+{% endblock %}

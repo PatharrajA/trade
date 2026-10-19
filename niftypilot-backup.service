@@ -1,0 +1,14 @@
+[Unit]
+Description=Verify and back up NiftyPilot SQLite database
+
+[Service]
+Type=oneshot
+User=niftypilot
+Group=niftypilot
+WorkingDirectory=/opt/niftypilot
+ExecStart=/opt/niftypilot/scripts/backup_sqlite.sh
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/niftypilot/data/backups
+NoNewPrivileges=true
