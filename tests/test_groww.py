@@ -141,6 +141,69 @@ async def test_groww_historical_and_order_responses_are_normalized(tmp_path):
         await client.client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_groww_historical_request_retries_rate_limit(tmp_path):
+    attempts = 0
+
+    def handler(request: httpx.Request):
+        nonlocal attempts
+        assert request.url.path == "/v1/historical/candles"
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "0"},
+                json={"code": "429", "message": "Rate limit has breached"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "status": "SUCCESS",
+                "payload": {
+                    "candles": [["2026-09-01T09:15:00", 100, 102, 99, 101, 1000, 0]]
+                },
+            },
+        )
+
+    client = _client(tmp_path, handler)
+    client._historical_min_interval_seconds = 0
+    try:
+        rows = await client.historical_candles(
+            client.index_key("NIFTY"), date(2026, 9, 1), date(2026, 9, 1)
+        )
+        assert attempts == 2
+        assert rows[0][4] == 101
+    finally:
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_groww_quote_ignores_non_numeric_market_placeholders(tmp_path):
+    def handler(request: httpx.Request):
+        assert request.url.path == "/v1/live-data/quote"
+        return httpx.Response(
+            200,
+            json={
+                "status": "SUCCESS",
+                "payload": {
+                    "bid_price": "--",
+                    "offer_price": "--",
+                    "last_price": "25000.25",
+                    "last_trade_time": 1_797_000_000_000,
+                },
+            },
+        )
+
+    client = _client(tmp_path, handler)
+    try:
+        quote = (await client.quotes([client.index_key("NIFTY")]))["NSE-NIFTY"]
+        assert quote.bid == Decimal("25000.25")
+        assert quote.ask == Decimal("25000.25")
+        assert quote.last == Decimal("25000.25")
+    finally:
+        await client.client.aclose()
+
+
 def test_groww_naive_timestamps_are_interpreted_as_india_time():
     stamp = GrowwClient._timestamp("2026-10-12T09:15:00")
     assert stamp.utcoffset().total_seconds() == 19_800

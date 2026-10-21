@@ -21,6 +21,7 @@ class SyncResult:
     futures_contracts: int
     option_contracts: int
     warnings: list[str]
+    incomplete_reasons: list[str]
 
 
 def _parse(raw: list) -> tuple[datetime, Decimal, Decimal, Decimal, Decimal, int, int]:
@@ -45,6 +46,28 @@ def _chunks(start: date, end: date, days: int = 28):
 
 def _naive_utc(value: datetime) -> datetime:
     return (value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)).replace(tzinfo=None)
+
+
+def _has_candles(
+    session_factory,
+    provider: str,
+    underlying_code: str,
+    data_role: str,
+    start: date,
+    end: date,
+) -> bool:
+    with session_factory() as session:
+        return session.scalar(
+            select(Candle.id).where(
+                Candle.provider == provider,
+                Candle.underlying_code == underlying_code,
+                Candle.data_role == data_role,
+                Candle.timeframe == "5minute",
+                Candle.timestamp >= datetime.combine(start, datetime.min.time()),
+                Candle.timestamp <= datetime.combine(end, datetime.max.time()),
+                Candle.source_verified.is_(True),
+            ).limit(1)
+        ) is not None
 
 
 async def _store_candles(
@@ -189,6 +212,7 @@ async def sync_research_data(
     futures_contract_count = 0
     option_contract_count = 0
     warnings: list[str] = []
+    incomplete_reasons: list[str] = []
     completed_steps = 0
     total_steps = len(indices) * (3 if include_options else 2)
 
@@ -283,6 +307,11 @@ async def sync_research_data(
             futures_contract_count,
             0,
             warnings,
+            [
+                f"{code}: no verified {provider} futures candles are available for the requested period"
+                for code in indices
+                if not _has_candles(session_factory, provider, code, "FUTURE", start, end)
+            ],
         )
 
     for code in indices:
@@ -377,6 +406,15 @@ async def sync_research_data(
         warnings.append(
             f"No verified {provider} historical option candles were stored. The backtest will fail closed instead of manufacturing premiums."
         )
+    for code in indices:
+        if not _has_candles(session_factory, provider, code, "FUTURE", start, end):
+            incomplete_reasons.append(
+                f"{code}: no verified {provider} futures candles are available for the requested period"
+            )
+        if not _has_candles(session_factory, provider, code, "OPTION", start, end):
+            incomplete_reasons.append(
+                f"{code}: no verified {provider} option candles are available for the requested period"
+            )
     return SyncResult(
         underlying_count,
         futures_count,
@@ -384,4 +422,5 @@ async def sync_research_data(
         futures_contract_count,
         option_contract_count,
         warnings,
+        incomplete_reasons,
     )

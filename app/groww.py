@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import os
 import re
+import time as monotonic_time
 from datetime import UTC, date, datetime, time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -41,6 +43,13 @@ class GrowwClient:
         self.client = client or httpx.AsyncClient(timeout=20)
         self._instruments: dict[str, dict[str, str]] = {}
         self._loaded_on: date | None = None
+        # Groww applies shared limits to historical endpoints. Keep research
+        # traffic conservative and serialize it so a multi-year discovery loop
+        # cannot burst dozens of monthly requests at once.
+        self._historical_request_lock = asyncio.Lock()
+        self._last_historical_request_at = 0.0
+        self._historical_min_interval_seconds = 0.5
+        self._maximum_rate_limit_retries = 5
 
     def access_token(self) -> str:
         try:
@@ -73,24 +82,71 @@ class GrowwClient:
             "X-API-VERSION": "1.0",
         }
 
-    async def _json(self, method: str, path: str, **kwargs) -> dict[str, Any]:
-        response = await self.client.request(
-            method,
-            f"{self.api_url}{path}",
-            headers=self._headers(self.access_token()),
-            **kwargs,
-        )
-        if response.is_error:
-            detail = ""
+    async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        async def send() -> httpx.Response:
+            return await self.client.request(
+                method,
+                f"{self.api_url}{path}",
+                headers=self._headers(self.access_token()),
+                **kwargs,
+            )
+
+        if not path.startswith("/v1/historical/"):
+            return await send()
+
+        async with self._historical_request_lock:
+            elapsed = monotonic_time.monotonic() - self._last_historical_request_at
+            delay = self._historical_min_interval_seconds - elapsed
+            if delay > 0:
+                await asyncio.sleep(delay)
             try:
-                detail = str(response.json().get("message") or response.json().get("error") or "")
-            except Exception:
-                detail = response.text[:160]
+                return await send()
+            finally:
+                self._last_historical_request_at = monotonic_time.monotonic()
+
+    @staticmethod
+    def _response_detail(response: httpx.Response) -> str:
+        try:
+            body = response.json()
+            return str(body.get("message") or body.get("error") or body)
+        except Exception:
+            return response.text[:160]
+
+    async def _json(self, method: str, path: str, **kwargs) -> dict[str, Any]:
+        response: httpx.Response | None = None
+        maximum_retries = (
+            self._maximum_rate_limit_retries if path.startswith("/v1/historical/") else 0
+        )
+        for attempt in range(maximum_retries + 1):
+            response = await self._request(method, path, **kwargs)
+            if response.status_code != 429:
+                break
+            if attempt >= maximum_retries:
+                break
+            retry_after = response.headers.get("Retry-After", "")
+            try:
+                wait_seconds = max(float(retry_after), 0.0)
+            except ValueError:
+                wait_seconds = float(2**attempt)
+            if not retry_after:
+                wait_seconds = float(2**attempt)
+            await asyncio.sleep(min(wait_seconds, 30.0))
+
+        assert response is not None
+        if response.is_error:
+            detail = self._response_detail(response)
             raise GrowwError(f"Groww request failed ({response.status_code}){': ' + detail if detail else ''}")
         payload = response.json()
         if str(payload.get("status", "SUCCESS")).upper() != "SUCCESS":
             raise GrowwError(str(payload.get("message") or payload.get("error") or "Groww request was unsuccessful"))
         return payload
+
+    @staticmethod
+    def _decimal(value: Any) -> Decimal:
+        try:
+            return Decimal(str(value)) if value not in (None, "") else Decimal("0")
+        except (InvalidOperation, TypeError, ValueError):
+            return Decimal("0")
 
     async def validate_token(self, token: str, *, market_data: bool) -> tuple[bool, str]:
         token = token.strip()
@@ -305,9 +361,9 @@ class GrowwClient:
             depth = data.get("depth") or {}
             buys = depth.get("buy") or [{}]
             sells = depth.get("sell") or [{}]
-            bid = Decimal(str(data.get("bid_price") or buys[0].get("price") or 0))
-            ask = Decimal(str(data.get("offer_price") or data.get("ask_price") or sells[0].get("price") or 0))
-            last = Decimal(str(data.get("last_price") or data.get("ltp") or data.get("close") or 0))
+            bid = self._decimal(data.get("bid_price") or buys[0].get("price"))
+            ask = self._decimal(data.get("offer_price") or data.get("ask_price") or sells[0].get("price"))
+            last = self._decimal(data.get("last_price") or data.get("ltp") or data.get("close"))
             if bid <= 0:
                 bid = last
             if ask <= 0:

@@ -58,9 +58,13 @@ class ResearchJobService:
                 run = session.get(ResearchSyncRun, run_id)
                 if run is None:
                     return
-                run.status = "COMPLETE"
+                run.status = "PARTIAL" if result.incomplete_reasons else "COMPLETE"
                 run.progress_percent = 100
-                run.current_step = "Download complete"
+                run.current_step = (
+                    "Download incomplete; submit the same range to resume"
+                    if result.incomplete_reasons
+                    else "Download complete"
+                )
                 run.result_json = json.dumps(
                     {
                         "spot": result.underlying_candles,
@@ -69,8 +73,10 @@ class ResearchJobService:
                         "future_contracts": result.futures_contracts,
                         "option_contracts": result.option_contracts,
                         "warnings": result.warnings,
+                        "incomplete_reasons": result.incomplete_reasons,
                     }
                 )
+                run.error_message = "; ".join(result.incomplete_reasons) or None
                 run.completed_at = datetime.now(UTC)
                 session.commit()
         except asyncio.CancelledError:
