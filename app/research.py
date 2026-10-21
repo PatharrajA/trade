@@ -24,16 +24,34 @@ class SyncResult:
     incomplete_reasons: list[str]
 
 
-def _parse(raw: list) -> tuple[datetime, Decimal, Decimal, Decimal, Decimal, int, int]:
-    stamp = datetime.fromisoformat(str(raw[0]).replace("Z", "+00:00"))
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
-    return (
-        stamp.astimezone(UTC),
-        *(Decimal(str(raw[index])) for index in range(1, 5)),
-        int(raw[5] or 0),
-        int(raw[6] or 0) if len(raw) > 6 else 0,
-    )
+def _parse(raw: list) -> tuple[datetime, Decimal, Decimal, Decimal, Decimal, int, int] | None:
+    try:
+        if len(raw) < 6:
+            return None
+        stamp = datetime.fromisoformat(str(raw[0]).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+        prices = tuple(Decimal(str(raw[index])) for index in range(1, 5))
+        if any(not value.is_finite() or value <= 0 for value in prices):
+            return None
+        open_, high, low, close = prices
+        if high < max(open_, low, close) or low > min(open_, high, close):
+            return None
+        volume_value = Decimal(str(raw[5] or 0))
+        oi_value = Decimal(str(raw[6] or 0)) if len(raw) > 6 else Decimal("0")
+        if not volume_value.is_finite() or not oi_value.is_finite():
+            return None
+        return (
+            stamp.astimezone(UTC),
+            open_,
+            high,
+            low,
+            close,
+            max(int(volume_value), 0),
+            max(int(oi_value), 0),
+        )
+    except (ArithmeticError, IndexError, TypeError, ValueError):
+        return None
 
 
 def _chunks(start: date, end: date, days: int = 28):
@@ -82,15 +100,23 @@ async def _store_candles(
     contract: Contract | None = None,
     data_role: str = "SPOT",
     minutes: int = 5,
+    warnings: list[str] | None = None,
 ) -> int:
     inserted = 0
+    rejected = 0
     for chunk_start, chunk_end in _chunks(start, end):
         rows = (
             await client.historical_option_candles(contract, chunk_start, chunk_end, minutes)
             if contract
             else await client.historical_candles(instrument_key, chunk_start, chunk_end, minutes)
         )
-        parsed = [_parse(row) for row in rows]
+        parsed = []
+        for row in rows:
+            candle = _parse(row)
+            if candle is None:
+                rejected += 1
+                continue
+            parsed.append(candle)
         if not parsed:
             continue
         with session_factory() as session:
@@ -128,6 +154,10 @@ async def _store_candles(
                 )
                 inserted += 1
             session.commit()
+    if rejected and warnings is not None:
+        warnings.append(
+            f"{provider}: skipped {rejected} malformed {data_role.lower()} candles for {instrument_key}"
+        )
     return inserted
 
 
@@ -226,6 +256,7 @@ async def sync_research_data(
             end,
             provider=provider,
             data_role="SPOT",
+            warnings=warnings,
         )
         if include_one_minute:
             underlying_count += await _store_candles(
@@ -238,6 +269,7 @@ async def sync_research_data(
                 provider=provider,
                 data_role="SPOT",
                 minutes=1,
+                warnings=warnings,
             )
         completed_steps += 1
         if progress:
@@ -273,6 +305,7 @@ async def sync_research_data(
                     provider=provider,
                     contract=contract,
                     data_role="FUTURE",
+                    warnings=warnings,
                 )
                 with session_factory() as session:
                     first_candle = session.scalar(
@@ -379,6 +412,7 @@ async def sync_research_data(
                 provider=provider,
                 contract=contract,
                 data_role="OPTION",
+                warnings=warnings,
             )
             option_count += count
             with session_factory() as session:
