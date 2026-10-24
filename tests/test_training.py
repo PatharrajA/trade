@@ -6,7 +6,20 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.models import Base, Candle
-from app.training import train_regime_model
+import pandas as pd
+
+from app.training import day_split_indices, train_regime_model
+
+
+def test_day_split_keeps_indices_together_and_purges_prior_day():
+    stamps = pd.Series([
+        datetime(2025, 1, day, 4, index * 5, tzinfo=UTC)
+        for day in range(1, 21) for index in range(2)
+    ])
+    train_end, validation_start, validation_end = day_split_indices(stamps, 0.8)
+    assert train_end == 30
+    assert validation_start == 32
+    assert validation_end == len(stamps)
 
 
 def test_training_reports_missing_futures_before_loading_xgboost(tmp_path):

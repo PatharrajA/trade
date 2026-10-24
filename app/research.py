@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
+from .data_quality import _missing_timestamps
 from .domain import Contract
 from .models import Candle, Instrument
 from .providers import BrokerClient, provider_name
@@ -88,6 +89,31 @@ def _has_candles(
         ) is not None
 
 
+def _known_gap_count(
+    session_factory,
+    provider: str,
+    underlying_code: str,
+    data_role: str,
+    start: date,
+    end: date,
+) -> int:
+    with session_factory() as session:
+        values = session.scalars(
+            select(Candle.timestamp)
+            .where(
+                Candle.provider == provider,
+                Candle.underlying_code == underlying_code,
+                Candle.data_role == data_role,
+                Candle.timeframe == "5minute",
+                Candle.timestamp >= datetime.combine(start, datetime.min.time()),
+                Candle.timestamp <= datetime.combine(end, datetime.max.time()),
+                Candle.source_verified.is_(True),
+            )
+            .order_by(Candle.timestamp)
+        ).all()
+    return len(_missing_timestamps(list(values)))
+
+
 async def _store_candles(
     client: BrokerClient,
     session_factory,
@@ -100,11 +126,34 @@ async def _store_candles(
     contract: Contract | None = None,
     data_role: str = "SPOT",
     minutes: int = 5,
+    repair_only: bool = False,
     warnings: list[str] | None = None,
 ) -> int:
     inserted = 0
     rejected = 0
-    for chunk_start, chunk_end in _chunks(start, end):
+    ranges = list(_chunks(start, end))
+    if repair_only:
+        with session_factory() as session:
+            stored = session.scalars(
+                select(Candle.timestamp)
+                .where(
+                    Candle.provider == provider,
+                    Candle.instrument_key == instrument_key,
+                    Candle.timeframe == f"{minutes}minute",
+                    Candle.timestamp >= datetime.combine(start, datetime.min.time()),
+                    Candle.timestamp <= datetime.combine(end, datetime.max.time()),
+                    Candle.source_verified.is_(True),
+                )
+                .order_by(Candle.timestamp)
+            ).all()
+        if stored:
+            gap_days = sorted({
+                stamp.astimezone(ZoneInfo("Asia/Kolkata")).date()
+                for stamp in _missing_timestamps(list(stored), minutes)
+                if start <= stamp.astimezone(ZoneInfo("Asia/Kolkata")).date() <= end
+            })
+            ranges = [(day, day) for day in gap_days]
+    for chunk_start, chunk_end in ranges:
         rows = (
             await client.historical_option_candles(contract, chunk_start, chunk_end, minutes)
             if contract
@@ -119,6 +168,8 @@ async def _store_candles(
             parsed.append(candle)
         if not parsed:
             continue
+        first_stamp = min(_naive_utc(item[0]) for item in parsed)
+        last_stamp = max(_naive_utc(item[0]) for item in parsed)
         with session_factory() as session:
             existing = {
                 _naive_utc(value)
@@ -127,13 +178,14 @@ async def _store_candles(
                         Candle.provider == provider,
                         Candle.instrument_key == instrument_key,
                         Candle.timeframe == f"{minutes}minute",
-                        Candle.timestamp >= datetime.combine(chunk_start, datetime.min.time()),
-                        Candle.timestamp <= datetime.combine(chunk_end, datetime.max.time()),
+                        Candle.timestamp >= first_stamp,
+                        Candle.timestamp <= last_stamp,
                     )
                 )
             }
             for stamp, open_, high, low, close, volume, oi in parsed:
-                if _naive_utc(stamp) in existing:
+                normalized = _naive_utc(stamp)
+                if normalized in existing:
                     continue
                 session.add(
                     Candle(
@@ -152,6 +204,7 @@ async def _store_candles(
                         data_role=data_role,
                     )
                 )
+                existing.add(normalized)
                 inserted += 1
             session.commit()
     if rejected and warnings is not None:
@@ -233,6 +286,7 @@ async def sync_research_data(
     *,
     include_options: bool,
     include_one_minute: bool = False,
+    repair_only: bool = False,
     progress: Callable[[int, int, str], Awaitable[None]] | None = None,
 ) -> SyncResult:
     provider = provider_name(client.provider)
@@ -256,6 +310,7 @@ async def sync_research_data(
             end,
             provider=provider,
             data_role="SPOT",
+            repair_only=repair_only,
             warnings=warnings,
         )
         if include_one_minute:
@@ -269,6 +324,7 @@ async def sync_research_data(
                 provider=provider,
                 data_role="SPOT",
                 minutes=1,
+                repair_only=repair_only,
                 warnings=warnings,
             )
         completed_steps += 1
@@ -305,6 +361,7 @@ async def sync_research_data(
                     provider=provider,
                     contract=contract,
                     data_role="FUTURE",
+                    repair_only=repair_only,
                     warnings=warnings,
                 )
                 with session_factory() as session:
@@ -412,6 +469,7 @@ async def sync_research_data(
                 provider=provider,
                 contract=contract,
                 data_role="OPTION",
+                repair_only=repair_only,
                 warnings=warnings,
             )
             option_count += count
@@ -449,6 +507,26 @@ async def sync_research_data(
             incomplete_reasons.append(
                 f"{code}: no verified {provider} option candles are available for the requested period"
             )
+        if repair_only:
+            for role in ("SPOT", "FUTURE"):
+                remaining = _known_gap_count(session_factory, provider, code, role, start, end)
+                if remaining:
+                    incomplete_reasons.append(
+                        f"{code}: {remaining} known {role.lower()} intraday gaps remain after repair"
+                    )
+            with session_factory() as session:
+                pending_metadata = session.scalar(
+                    select(Instrument.id).where(
+                        Instrument.provider == provider,
+                        Instrument.underlying_code == code,
+                        Instrument.instrument_kind == "OPTION",
+                        Instrument.metadata_verified.is_(False),
+                    ).limit(1)
+                )
+            if pending_metadata:
+                incomplete_reasons.append(
+                    f"{code}: historical option lot/tick metadata still requires verification"
+                )
     return SyncResult(
         underlying_count,
         futures_count,

@@ -52,10 +52,11 @@ def select_option(
             reasons.append(f"{moneyness}: quote unavailable")
             continue
         stamp = quote.timestamp if quote.timestamp.tzinfo else quote.timestamp.replace(tzinfo=UTC)
+        quote_age = (now - stamp.astimezone(UTC)).total_seconds()
         checks = (
             (quote.bid > 0 and quote.ask >= quote.bid, "invalid bid/ask"),
             (_spread_pct(quote) <= max_spread_pct, "spread too wide"),
-            ((now - stamp.astimezone(UTC)).total_seconds() <= max_quote_age_seconds, "stale quote"),
+            (0 <= quote_age <= max_quote_age_seconds, "stale or future-dated quote"),
             (quote.volume > 0 and quote.open_interest > 0, "volume or OI unavailable"),
             (quote.delta is not None and delta_min <= abs(quote.delta) <= delta_max, "delta outside range"),
         )

@@ -9,3 +9,4 @@ data/*.db-wal
 data/backups/
 data/secrets/
 models/*.json
+models/*

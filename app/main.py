@@ -246,6 +246,7 @@ def start_backtest(
     entry_delay_bars: int = Form(1),
     minimum_option_volume: int = Form(1),
     maximum_spread_pct: Decimal = Form(Decimal("1.5")),
+    compare_rule_only: bool = Form(False),
     session: Session = Depends(get_session),
 ):
     allowed = {"NIFTY", "BANK_NIFTY", "SENSEX"}
@@ -260,14 +261,39 @@ def start_backtest(
     if not selected or start_date > end_date or capital <= 0 or not (Decimal("0") < risk_pct <= Decimal("2")) or slippage_pct < 0 or entry_delay_bars < 1 or minimum_option_volume < 0 or maximum_spread_pct <= 0:
         return flash_redirect("/backtests", "Please check the backtest inputs", False)
     model_metadata = load_model_metadata(config.model_path)
+    if strategy_mode == "MODEL" and not model_metadata:
+        return flash_redirect("/backtests", "Train and activate a model before running a model backtest", False)
+    training_end = model_metadata.get("training_end")
+    if strategy_mode == "MODEL" and training_end and start_date <= date.fromisoformat(training_end):
+        return flash_redirect(
+            "/backtests",
+            f"Model testing must start after its training period ({training_end})",
+            False,
+        )
+    run_config = {"indices": selected, "capital": str(capital), "risk_pct": str(risk_pct), "slippage_pct": str(slippage_pct), "historical_provider": historical_provider, "cost_model": cost_model, "strategy_mode": strategy_mode, "strike_policy": strike_policy, "entry_delay_bars": entry_delay_bars, "minimum_option_volume": minimum_option_volume, "maximum_spread_pct": str(maximum_spread_pct), "model_version": model_metadata.get("version"), "feature_schema": model_metadata.get("feature_schema"), "compare_rule_only": compare_rule_only}
     run = BacktestRun(
-        configuration_json=json.dumps({"indices": selected, "capital": str(capital), "risk_pct": str(risk_pct), "slippage_pct": str(slippage_pct), "historical_provider": historical_provider, "cost_model": cost_model, "strategy_mode": strategy_mode, "strike_policy": strike_policy, "entry_delay_bars": entry_delay_bars, "minimum_option_volume": minimum_option_volume, "maximum_spread_pct": str(maximum_spread_pct), "model_version": model_metadata.get("version"), "feature_schema": model_metadata.get("feature_schema")}),
+        configuration_json=json.dumps(run_config),
         start_date=start_date,
         end_date=end_date,
     )
     session.add(run)
+    session.flush()
+    comparison_run = None
+    if compare_rule_only and strategy_mode == "MODEL":
+        comparison_config = {**run_config, "strategy_mode": "RULE_ONLY", "compare_rule_only": False, "comparison_parent_id": run.id}
+        comparison_run = BacktestRun(
+            configuration_json=json.dumps(comparison_config),
+            start_date=start_date,
+            end_date=end_date,
+        )
+        session.add(comparison_run)
+        session.flush()
+        run_config["comparison_run_id"] = comparison_run.id
+        run.configuration_json = json.dumps(run_config)
     session.commit()
     backtest_service.submit(run.id)
+    if comparison_run is not None:
+        backtest_service.submit(comparison_run.id)
     return RedirectResponse(f"/backtests?run_id={run.id}", status_code=303)
 
 
@@ -279,6 +305,7 @@ async def sync_backtest_data(
     historical_provider: str = Form("UPSTOX"),
     include_options: bool = Form(False),
     include_one_minute: bool = Form(False),
+    repair_only: bool = Form(False),
     session: Session = Depends(get_session),
 ):
     allowed = {"NIFTY", "BANK_NIFTY", "SENSEX"}
@@ -303,6 +330,7 @@ async def sync_backtest_data(
                 "end_date": end_date.isoformat(),
                 "include_options": include_options,
                 "include_one_minute": include_one_minute,
+                "repair_only": repair_only,
             }
         ),
     )
@@ -311,7 +339,7 @@ async def sync_backtest_data(
     research_service.submit(run.id)
     return flash_redirect(
         "/backtests",
-        f"Research download #{run.id} queued. Re-running the same range safely resumes from stored candles.",
+        f"Research {'repair' if repair_only else 'download'} #{run.id} queued. Existing candles are preserved and duplicates are skipped.",
     )
 
 

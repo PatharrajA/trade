@@ -1,7 +1,7 @@
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from app.data_quality import research_readiness
+from app.data_quality import _missing_intervals, research_readiness
 from app.models import Candle, Instrument
 
 
@@ -58,6 +58,29 @@ def test_research_readiness_reports_alignment_gaps_and_metadata(session):
     assert row.futures_count == 2
     assert row.aligned_count == 2
     assert row.missing_intervals == 1
+    assert row.spot_missing_intervals == 1
+    assert row.futures_missing_intervals == 0
+    assert row.first_missing_timestamp == start + timedelta(minutes=10)
+    assert row.last_missing_timestamp == start + timedelta(minutes=10)
     assert row.zero_volume_percent == 100
     assert row.option_count == 1
     assert row.verified_contracts == 1
+    assert row.metadata_gap_contracts == 0
+
+
+def test_missing_bars_excludes_preopen_and_special_session_breaks():
+    # 03:35 UTC is 09:05 IST; the 09:10 pre-open interval is not a market bar.
+    assert _missing_intervals([
+        datetime(2025, 1, 2, 3, 35, tzinfo=UTC),
+        datetime(2025, 1, 2, 3, 45, tzinfo=UTC),
+    ]) == 0
+    # NSE closed between the two disaster-recovery sessions on these Saturdays.
+    for day in (date(2024, 3, 2), date(2024, 5, 18)):
+        assert _missing_intervals([
+            datetime(day.year, day.month, day.day, 4, 30, tzinfo=UTC),
+            datetime(day.year, day.month, day.day, 6, 0, tzinfo=UTC),
+        ]) == 0
+    assert _missing_intervals([
+        datetime(2025, 1, 2, 3, 45, tzinfo=UTC),
+        datetime(2025, 1, 2, 3, 55, tzinfo=UTC),
+    ]) == 1

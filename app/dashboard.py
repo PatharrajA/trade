@@ -189,6 +189,24 @@ def backtests_context(session: Session, selected_id: int | None = None) -> dict:
     selected = session.get(BacktestRun, selected_id) if selected_id else (runs[0] if runs else None)
     summary = json.loads(selected.summary_json) if selected and selected.summary_json else None
     warnings = json.loads(selected.warnings_json) if selected and selected.warnings_json else []
+    comparison = None
+    if selected:
+        try:
+            selected_config = json.loads(selected.configuration_json)
+        except (TypeError, ValueError):
+            selected_config = {}
+        comparison_id = selected_config.get("comparison_run_id") or selected_config.get("comparison_parent_id")
+        comparison_run = session.get(BacktestRun, int(comparison_id)) if comparison_id else None
+        if comparison_run:
+            try:
+                comparison_config = json.loads(comparison_run.configuration_json)
+            except (TypeError, ValueError):
+                comparison_config = {}
+            comparison = {
+                "run": comparison_run,
+                "strategy_mode": comparison_config.get("strategy_mode", "RULE_ONLY"),
+                "summary": json.loads(comparison_run.summary_json) if comparison_run.summary_json else None,
+            }
     model_metadata = load_model_metadata(config.model_path)
     run_details = {}
     for run in runs:
@@ -228,6 +246,7 @@ def backtests_context(session: Session, selected_id: int | None = None) -> dict:
         "runs": runs,
         "selected": selected,
         "summary": summary,
+        "comparison": comparison,
         "warnings": warnings,
         "model_ready": bool(model_metadata) and model_metadata.get("feature_schema") == FEATURE_SCHEMA,
         "model_metadata": model_metadata,

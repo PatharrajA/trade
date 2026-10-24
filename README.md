@@ -17,11 +17,11 @@ NiftyPilot is a personal Indian index-options bot for NIFTY 50, BANK NIFTY and S
 - Backtests replay verified real option candles and apply selectable Upstox Basic, Upstox Plus or Groww costs.
 - Telegram group and optional private-owner alerts through a persistent retry outbox.
 - Overview, Orders, Backtests, Telegram and Settings screens.
-- Data-readiness matrix with candle coverage, missing intervals, spot/futures alignment, zero-volume percentage and verified contract metadata.
-- Background, resumable research downloads with persisted progress. Re-submitting a range safely stores only missing candles.
+- Data-readiness matrix with separate spot/futures intraday gaps, first/last missing timestamps, alignment, zero-volume percentage and unmatched historical contract metadata.
+- Background, resumable research downloads with persisted progress and a targeted repair mode for known intraday gaps.
 - Candidate-model registry with confusion matrix, per-class precision/recall, feature importance and explicit activation.
 - Historical contract-metadata CSV import for records that cannot be verified from today's broker instrument master.
-- Rule-only comparison backtests, ATM-only versus ATM→ITM1 policies, liquidity/spread rejection, entry delay, adaptive slippage and one-minute stop/target resolution when available.
+- Paired model/rule-only backtests, per-index decision funnels with exact rejection counts, ATM-only versus ATM→ITM1 policies, liquidity/spread rejection, entry delay, adaptive slippage and one-minute stop/target resolution when available.
 - Full Paper/Live decision audit including rule checks, bid/ask, slippage, delta, IV, risk budget, stop and target.
 - Manual pause and position exit controls, one-minute Live reconciliation, immediate risk shutdown alerts and post-restart Live reconfirmation.
 
@@ -87,13 +87,15 @@ Use the Backtests page in this order. Download, training and replay automaticall
 1. Download verified five-minute history. The application always requests both spot-index and aligned index-futures candles; enable the option checkbox when historical CE/PE P&L is required.
 2. Train a candidate XGBoost model. Candidate files are kept under `models/candidates/`; training does not silently replace the active model.
 3. Confirm that the Backtests screen shows enough verified futures candles and, for trade replay, verified historical option candles.
-4. Review its chronological validation metrics, confusion matrix, confidence distribution and feature importance, then explicitly activate it. Activation atomically updates the single common `models/regime.json` and archives the previous version.
+4. Review its chronological validation metrics, confusion matrix, confidence distribution and feature importance, then explicitly activate it. Validation holds out complete trading days with a one-day gap from training and reports directional precision at several confidence thresholds. After scoring, the saved candidate is fitted again on the full requested period; its validation metrics describe the earlier holdout fit. Activation atomically updates the single common `models/regime.json` and archives the previous version.
 5. Run a backtest beginning after the model training end date. Run the same period with **Rule-only comparison** to check whether the model adds value.
 6. Review warnings, P&L, drawdown, monthly/exit/strike/side breakdowns, doubled-slippage stress and exported CSV trades.
 
 Historical data is always provider-tagged. A Groww backtest cannot accidentally consume Upstox candles and vice versa. The UI submits the active broker on every research step. Model files are deliberately not provider-specific because both feeds are normalized to the same `spot-futures-v2` feature schema. The training provider, date coverage and validation metrics remain recorded in common model metadata for auditability.
 
 The engine never synthesizes option premiums from index prices. When historical bid/ask is unavailable, it uses verified option OHLC with configured two-sided slippage and reports the limitation. A historical Groww symbol may be downloaded even when it has disappeared from today's instrument master, but it is marked unverified and excluded from P&L until its historical lot size is known.
+
+Backtests fail with an explicit data reason when the selected period has no option candles linked to verified historical contract metadata. A completed zero-trade run reports the number of evaluated bars, confident model predictions and confirmed signals. Do not lower the confidence gate based only on the number of signals; compare directional precision and after-cost option P&L on unseen dates first.
 
 For pending Groww metadata, export the CSV from **Backtests → Historical contract metadata**, fill lot size and tick size from a trustworthy broker/exchange archive, and import it. The importer only updates already-downloaded matching contracts and records `CSV_IMPORT` as the source.
 

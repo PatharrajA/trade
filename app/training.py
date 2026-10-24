@@ -19,6 +19,23 @@ def model_metadata_path(model_path: Path) -> Path:
     return model_path.with_name(f"{model_path.stem}.metadata.json")
 
 
+def day_split_indices(timestamps: pd.Series, train_fraction: float, validation_fraction: float | None = None) -> tuple[int, int, int]:
+    """Split complete India trading days, leaving one day between train and validation."""
+    local_days = pd.to_datetime(timestamps, utc=True).dt.tz_convert("Asia/Kolkata").dt.date.to_numpy()
+    days = np.unique(local_days)
+    if len(days) < 10:
+        raise RuntimeError("At least ten distinct trading days are required for validation")
+    boundary = max(2, min(len(days) - 1, int(len(days) * train_fraction)))
+    train_end = int(np.searchsorted(local_days, days[boundary - 1], side="left"))
+    validation_start = int(np.searchsorted(local_days, days[boundary], side="left"))
+    validation_end = (
+        len(local_days)
+        if validation_fraction is None
+        else int(np.searchsorted(local_days, days[min(len(days) - 1, boundary + max(1, int(len(days) * validation_fraction)) - 1)], side="right"))
+    )
+    return train_end, validation_start, validation_end
+
+
 def load_model_metadata(model_path: Path) -> dict:
     metadata_path = model_metadata_path(model_path)
     if not model_path.exists() or not metadata_path.exists():
@@ -191,26 +208,27 @@ def train_regime_model(
     class_to_id = {name: index for index, name in enumerate(classes)}
     labels = dataset.label.map(class_to_id).to_numpy(dtype=int)
     matrix = dataset[PRICE_FEATURES].to_numpy(dtype=float)
-    split = max(1, min(len(dataset) - 1, int(len(dataset) * 0.8)))
-    train_x, validation_x = matrix[:split], matrix[split:]
-    train_y, validation_y = labels[:split], labels[split:]
+    split, validation_start, _ = day_split_indices(dataset.timestamp, 0.8)
+    train_x, validation_x = matrix[:split], matrix[validation_start:]
+    train_y, validation_y = labels[:split], labels[validation_start:]
 
     counts = Counter(train_y.tolist())
     weights = np.array([len(train_y) / (len(counts) * counts[value]) for value in train_y], dtype=float)
     train_matrix = xgb.DMatrix(train_x, label=train_y, weight=weights, feature_names=PRICE_FEATURES)
     validation_matrix = xgb.DMatrix(validation_x, label=validation_y, feature_names=PRICE_FEATURES)
+    model_params = {
+        "objective": "multi:softprob",
+        "num_class": len(classes),
+        "eval_metric": "mlogloss",
+        "eta": 0.05,
+        "max_depth": 4,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "seed": 42,
+        "nthread": 1,
+    }
     booster = xgb.train(
-        {
-            "objective": "multi:softprob",
-            "num_class": len(classes),
-            "eval_metric": "mlogloss",
-            "eta": 0.05,
-            "max_depth": 4,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "seed": 42,
-            "nthread": 1,
-        },
+        model_params,
         train_matrix,
         num_boost_round=220,
         evals=[(validation_matrix, "validation")],
@@ -237,13 +255,22 @@ def train_regime_model(
             "precision": round(true_positive / predicted_total, 4) if predicted_total else 0.0,
             "recall": round(true_positive / actual_total, 4) if actual_total else 0.0,
         }
-    importance = booster.get_score(importance_type="gain")
     confidence = np.max(validation_probabilities, axis=1) if len(validation_probabilities) else np.array([])
+    directional_ids = [class_to_id[name] for name in ("UPTREND", "DOWNTREND") if name in class_to_id]
+    directional_confident = np.isin(predictions, directional_ids) & (confidence >= 0.70)
+    directional_correct = predictions == validation_y
+    directional_thresholds = []
+    for threshold in (0.4, 0.5, 0.6, 0.7):
+        accepted = np.isin(predictions, directional_ids) & (confidence >= threshold)
+        directional_thresholds.append({
+            "minimum_confidence": threshold,
+            "predictions": int(accepted.sum()),
+            "precision": round(float(directional_correct[accepted].mean()), 4) if accepted.any() else None,
+        })
     walk_forward: list[dict[str, float | int | str]] = []
     for train_fraction in (0.6, 0.7, 0.8):
-        fold_end = int(len(dataset) * train_fraction)
-        validation_end = min(len(dataset), fold_end + max(1, int(len(dataset) * 0.1)))
-        if fold_end < 300 or validation_end - fold_end < 50:
+        fold_end, fold_start, validation_end = day_split_indices(dataset.timestamp, train_fraction, 0.1)
+        if fold_end < 300 or validation_end - fold_start < 50:
             continue
         fold_y = labels[:fold_end]
         fold_counts = Counter(fold_y.tolist())
@@ -252,25 +279,15 @@ def train_regime_model(
             dtype=float,
         )
         fold_train = xgb.DMatrix(matrix[:fold_end], label=fold_y, weight=fold_weights, feature_names=PRICE_FEATURES)
-        fold_validation = xgb.DMatrix(matrix[fold_end:validation_end], label=labels[fold_end:validation_end], feature_names=PRICE_FEATURES)
+        fold_validation = xgb.DMatrix(matrix[fold_start:validation_end], label=labels[fold_start:validation_end], feature_names=PRICE_FEATURES)
         fold_model = xgb.train(
-            {
-                "objective": "multi:softprob",
-                "num_class": len(classes),
-                "eval_metric": "mlogloss",
-                "eta": 0.05,
-                "max_depth": 4,
-                "subsample": 0.8,
-                "colsample_bytree": 0.8,
-                "seed": 42,
-                "nthread": 1,
-            },
+            model_params,
             fold_train,
             num_boost_round=120,
             verbose_eval=False,
         )
         fold_predictions = np.argmax(fold_model.predict(fold_validation), axis=1)
-        expected = labels[fold_end:validation_end]
+        expected = labels[fold_start:validation_end]
         fold_scores = []
         for class_id in range(len(classes)):
             mask = expected == class_id
@@ -281,12 +298,21 @@ def train_regime_model(
                 "training_end": pd.Timestamp(dataset.iloc[fold_end - 1].timestamp).isoformat(),
                 "validation_end": pd.Timestamp(dataset.iloc[validation_end - 1].timestamp).isoformat(),
                 "training_samples": fold_end,
-                "validation_samples": validation_end - fold_end,
+                "validation_samples": validation_end - fold_start,
                 "accuracy": round(float(np.mean(fold_predictions == expected)), 4),
                 "balanced_accuracy": round(float(np.mean(fold_scores)), 4) if fold_scores else 0.0,
             }
         )
 
+    # Keep the holdout scores above, then save a model fitted through the full
+    # requested history so the most recent market period is represented.
+    full_counts = Counter(labels.tolist())
+    full_weights = np.array(
+        [len(labels) / (len(full_counts) * full_counts[value]) for value in labels], dtype=float
+    )
+    full_matrix = xgb.DMatrix(matrix, label=labels, weight=full_weights, feature_names=PRICE_FEATURES)
+    booster = xgb.train(model_params, full_matrix, num_boost_round=220, verbose_eval=False)
+    importance = booster.get_score(importance_type="gain")
     trained_at = datetime.now(UTC)
     metadata = {
         "version": f"regime-{trained_at.strftime('%Y%m%dT%H%M%SZ')}",
@@ -301,8 +327,13 @@ def train_regime_model(
         "features": PRICE_FEATURES,
         "classes": classes,
         "samples": len(dataset),
-        "training_samples": split,
-        "validation_samples": len(dataset) - split,
+        "training_samples": len(dataset),
+        "validation_fit_samples": split,
+        "fitted_through": pd.Timestamp(dataset.iloc[-1].timestamp).isoformat(),
+        "validation_model_fitted_through": pd.Timestamp(dataset.iloc[split - 1].timestamp).isoformat(),
+        "validation_samples": len(dataset) - validation_start,
+        "purged_samples": validation_start - split,
+        "validation_start": pd.Timestamp(dataset.iloc[validation_start].timestamp).isoformat(),
         "validation_accuracy": round(accuracy, 4),
         "balanced_accuracy": round(balanced_accuracy, 4),
         "confusion_matrix": confusion,
@@ -311,6 +342,12 @@ def train_regime_model(
         "validation_confidence": {
             "mean": round(float(np.mean(confidence)), 4) if len(confidence) else 0.0,
             "above_70_percent": round(float(np.mean(confidence >= 0.70) * 100), 2) if len(confidence) else 0.0,
+        },
+        "directional_validation": {
+            "predictions_above_70_percent": int(directional_confident.sum()),
+            "precision_above_70_percent": round(float(directional_correct[directional_confident].mean()), 4)
+            if directional_confident.any() else None,
+            "thresholds": directional_thresholds,
         },
         "walk_forward_validation": walk_forward,
         "class_counts": dict(Counter(dataset.label.tolist())),

@@ -35,3 +35,31 @@ def test_expiry_day_contract_is_not_eligible():
     item = Contract("today", "NIFTY", "NSE", "NIFTY", date.today(), Decimal("25000"), "CE", 50, Decimal("0.05"))
     selected = select_option([item], {"today": quote(item)}, spot=Decimal("25000"), direction="CE", trading_day=date.today())
     assert selected.contract is None
+
+
+def test_future_dated_quote_is_rejected():
+    item = contract("25000")
+    now = datetime.now(UTC)
+    future_quote = Quote(
+        item.instrument_key,
+        now + timedelta(seconds=10),
+        Decimal("100"),
+        Decimal("101"),
+        Decimal("100.5"),
+        1000,
+        5000,
+        0.52,
+        14.2,
+    )
+
+    selected = select_option(
+        [item],
+        {item.instrument_key: future_quote},
+        spot=Decimal("25000"),
+        direction="CE",
+        trading_day=date.today(),
+        now=now,
+    )
+
+    assert selected.contract is None
+    assert "future-dated quote" in selected.reason

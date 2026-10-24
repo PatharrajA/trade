@@ -48,3 +48,15 @@ def test_runtime_candle_upsert_normalizes_aware_and_naive_utc(session):
     assert len(rows) == 1
     assert rows[0].timestamp == naive
     assert rows[0].close == Decimal("25005")
+
+
+def test_runtime_parse_rejects_malformed_market_candles():
+    valid = ["2026-10-15T09:30:00", "100", "102", "99", "101", 1000, 0]
+    assert RuntimeService._parse(valid) is not None
+    for broken in (
+        [*valid[:2], "--", *valid[3:]],
+        [*valid[:4], "NaN", *valid[5:]],
+        [valid[0], "100", "99", "98", "101", 1000, 0],
+        valid[:3],
+    ):
+        assert RuntimeService._parse(broken) is None

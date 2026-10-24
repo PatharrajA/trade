@@ -52,6 +52,7 @@ class ResearchJobService:
                 date.fromisoformat(configuration["end_date"]),
                 include_options=bool(configuration["include_options"]),
                 include_one_minute=bool(configuration.get("include_one_minute", False)),
+                repair_only=bool(configuration.get("repair_only", False)),
                 progress=update,
             )
             with self.session_factory() as session:

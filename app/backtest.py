@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+from collections import Counter
 from concurrent.futures import Future, ProcessPoolExecutor
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -13,10 +14,79 @@ import pandas as pd
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
+from .data_quality import option_replay_issue
 from .models import BacktestRun, BacktestTrade, Candle, Instrument
 from .risk import RiskLimits, can_enter, option_charges, position_size
 from .strategy import RegimeModel, decide, rule_only_decide, with_futures_features
 from .training import front_future_frame
+
+
+FUNNEL_STAGES = (
+    "bars_evaluated",
+    "directional_predictions",
+    "confidence_passed",
+    "confirmed_signals",
+    "eligible_contracts",
+    "option_bars_available",
+    "liquidity_passed",
+    "risk_passed",
+    "executed_trades",
+)
+
+
+def _new_funnel() -> dict:
+    return {**{stage: 0 for stage in FUNNEL_STAGES}, "rejections": Counter(), "rejection_details": [], "rejection_details_omitted": 0}
+
+
+def _reject(funnel: dict, *, stage: str, reason: str, event: dict | None = None, attempts: list[dict] | None = None) -> None:
+    funnel["rejections"][reason] += 1
+    # Keep signal-level replay failures reviewable without storing one row for
+    # every ordinary RANGE bar in a multi-year run.
+    if event is not None and len(funnel["rejection_details"]) < 500:
+        decision = event.get("decision")
+        funnel["rejection_details"].append({
+            "timestamp": event["time"].isoformat(),
+            "stage": stage,
+            "reason": reason,
+            "direction": getattr(decision, "direction", None),
+            "regime": getattr(decision, "regime", None),
+            "confidence": round(float(getattr(decision, "confidence", 0)), 6),
+            "attempts": attempts or [],
+        })
+    elif event is not None:
+        funnel["rejection_details_omitted"] += 1
+
+
+def _strategy_rejection_reason(row: pd.Series, decision, strategy_mode: str) -> str:
+    if decision.reason == "Model unavailable":
+        return "MODEL_UNAVAILABLE"
+    if decision.reason == "Required market context unavailable":
+        return "REQUIRED_CONTEXT_UNAVAILABLE"
+    if strategy_mode == "MODEL":
+        if decision.regime not in {"UPTREND", "DOWNTREND"}:
+            return f"MODEL_{decision.regime}"
+        if decision.confidence < 0.70:
+            return "CONFIDENCE_BELOW_70"
+    close = float(row.close)
+    futures_close = float(row.get("futures_close", close))
+    futures_vwap = float(row.get("futures_vwap", row.vwap))
+    bullish = decision.regime == "UPTREND"
+    if bullish and futures_close <= futures_vwap or not bullish and futures_close >= futures_vwap:
+        return "FUTURES_VWAP_NOT_ALIGNED"
+    if bullish and row.ema9 <= row.ema20 or not bullish and row.ema9 >= row.ema20:
+        return "EMA_NOT_ALIGNED"
+    if bullish and close <= row.opening_range_high or not bullish and close >= row.opening_range_low:
+        return "OPENING_RANGE_NOT_CONFIRMED"
+    return "STRATEGY_RULES_NOT_ALIGNED"
+
+
+def _funnel_totals(by_index: dict[str, dict]) -> dict:
+    totals = {stage: sum(int(row[stage]) for row in by_index.values()) for stage in FUNNEL_STAGES}
+    reasons: Counter = Counter()
+    for row in by_index.values():
+        reasons.update(row["rejections"])
+    totals["rejections"] = dict(reasons)
+    return totals
 
 
 def metrics(rows: list[dict], capital: Decimal) -> dict:
@@ -122,17 +192,29 @@ def run_backtest_job(db_url: str, run_id: int, model_path: str) -> None:
                 raise RuntimeError(
                     f"Backtest must start after the model training period ({training_end}) to prevent in-sample results"
                 )
+            issues = [
+                issue for code in config["indices"]
+                if (issue := option_replay_issue(session, provider, code, run.start_date, run.end_date))
+            ]
+            if len(issues) == len(config["indices"]):
+                raise RuntimeError("Backtest cannot replay options. " + "; ".join(issues))
+            warnings.update(issues)
             events: list[dict] = []
+            funnels = {code: _new_funnel() for code in config["indices"]}
+            rule_only_baseline = {code: 0 for code in config["indices"]}
             for code_index, code in enumerate(config["indices"]):
+                funnel = funnels[code]
                 candles = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == code, Candle.data_role == "SPOT", Candle.timeframe == "5minute", Candle.timestamp >= datetime.combine(run.start_date, time.min, tzinfo=UTC), Candle.timestamp <= datetime.combine(run.end_date, time.max, tzinfo=UTC), Candle.source_verified.is_(True)).order_by(Candle.timestamp)).all()
                 if len(candles) < 60:
                     warnings.add(f"{code}: fewer than 60 verified candles")
+                    funnel["rejections"]["INSUFFICIENT_SPOT_HISTORY"] += 1
                     continue
                 future_candles = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == code, Candle.data_role == "FUTURE", Candle.timeframe == "5minute", Candle.timestamp >= datetime.combine(run.start_date, time.min, tzinfo=UTC), Candle.timestamp <= datetime.combine(run.end_date, time.max, tzinfo=UTC), Candle.source_verified.is_(True)).order_by(Candle.timestamp)).all()
                 future_instruments = session.scalars(select(Instrument).where(Instrument.provider == provider, Instrument.underlying_code == code, Instrument.instrument_kind == "FUTURE")).all()
                 futures_frame = front_future_frame(future_candles, future_instruments)
                 if len(futures_frame) < 60:
                     warnings.add(f"{code}: fewer than 60 aligned futures candles")
+                    funnel["rejections"]["INSUFFICIENT_FUTURES_HISTORY"] += 1
                     continue
                 frame = with_futures_features(
                     pd.DataFrame([{"timestamp": item.timestamp, "open": float(item.open), "high": float(item.high), "low": float(item.low), "close": float(item.close), "volume": item.volume} for item in candles]),
@@ -147,8 +229,26 @@ def run_backtest_job(db_url: str, run_id: int, model_path: str) -> None:
                         if strategy_mode == "MODEL"
                         else rule_only_decide(row)
                     )
-                    if decision.direction != "NO_TRADE":
-                        events.append({"time": stamp, "code": code, "decision": decision, "row": row})
+                    funnel["bars_evaluated"] += 1
+                    if strategy_mode == "MODEL" and rule_only_decide(row).direction != "NO_TRADE":
+                        rule_only_baseline[code] += 1
+                    if strategy_mode == "MODEL":
+                        if decision.regime not in {"UPTREND", "DOWNTREND"}:
+                            funnel["rejections"][_strategy_rejection_reason(row, decision, strategy_mode)] += 1
+                            continue
+                        funnel["directional_predictions"] += 1
+                        if decision.confidence < 0.70:
+                            funnel["rejections"]["CONFIDENCE_BELOW_70"] += 1
+                            continue
+                        funnel["confidence_passed"] += 1
+                    if decision.direction == "NO_TRADE":
+                        funnel["rejections"][_strategy_rejection_reason(row, decision, strategy_mode)] += 1
+                        continue
+                    if strategy_mode == "RULE_ONLY":
+                        funnel["directional_predictions"] += 1
+                        funnel["confidence_passed"] += 1
+                    funnel["confirmed_signals"] += 1
+                    events.append({"time": stamp, "code": code, "decision": decision, "row": row})
                 run.progress_percent = 5 + int((code_index + 1) / len(config["indices"]) * 30)
                 session.commit()
             events.sort(key=lambda item: (-item["decision"].confidence, item["code"]))
@@ -160,35 +260,68 @@ def run_backtest_job(db_url: str, run_id: int, model_path: str) -> None:
             daily: dict[date, dict[str, int | Decimal]] = {}
             consecutive_losses = 0
             for event in events:
-                if position_until and event["time"] <= position_until: continue
                 row, decision = event["row"], event["decision"]
+                funnel = funnels[event["code"]]
                 local_day = event["time"].astimezone(ZoneInfo("Asia/Kolkata")).date()
                 day_state = daily.setdefault(local_day, {"trades": 0, "pnl": Decimal("0")})
-                permitted, _ = can_enter(limits=limits, open_positions=0, trades_today=int(day_state["trades"]), consecutive_losses=consecutive_losses, realized_pnl_today=Decimal(day_state["pnl"]), quote_fresh=True, broker_connected=True, reconciled=True)
-                if not permitted:
-                    continue
                 cutoff = datetime.combine(local_day, time(15, 20), tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(UTC)
                 contract_choices = _historical_contract(session, provider, event["code"], decision.direction, local_day, Decimal(str(row.close)), strike_policy)
+                if not contract_choices:
+                    _reject(funnel, stage="eligible_contracts", reason="NO_ELIGIBLE_VERIFIED_CONTRACT", event=event)
+                    continue
+                funnel["eligible_contracts"] += 1
                 chosen = None
+                option_bars_found = False
+                attempts: list[dict] = []
                 for instrument, moneyness in contract_choices:
                     bars = session.scalars(select(Candle).where(Candle.provider == provider, Candle.instrument_key == instrument.instrument_key, Candle.data_role == "OPTION", Candle.timeframe == "5minute", Candle.timestamp > event["time"], Candle.timestamp <= cutoff, Candle.source_verified.is_(True)).order_by(Candle.timestamp)).all()
-                    if len(bars) >= entry_delay_bars:
-                        bars = bars[entry_delay_bars - 1 :]
-                        if bars[0].volume < minimum_option_volume:
-                            warnings.add(f"{event['code']}: option entry rejected below minimum volume")
+                    attempt = {
+                        "moneyness": moneyness,
+                        "instrument": instrument.instrument_key,
+                        "expiry": instrument.expiry.isoformat(),
+                        "strike": str(instrument.strike),
+                    }
+                    if len(bars) < entry_delay_bars:
+                        attempt["reason"] = "OPTION_ENTRY_BAR_MISSING"
+                        attempts.append(attempt)
+                        continue
+                    option_bars_found = True
+                    bars = bars[entry_delay_bars - 1 :]
+                    entry_bar = bars[0]
+                    if entry_bar.volume < minimum_option_volume:
+                        attempt["reason"] = "VOLUME_BELOW_MINIMUM"
+                        attempts.append(attempt)
+                        continue
+                    historical_oi_available = any(bar.open_interest > 0 for bar in bars)
+                    if historical_oi_available and entry_bar.open_interest <= 0:
+                        attempt["reason"] = "OPEN_INTEREST_UNAVAILABLE_AT_ENTRY"
+                        attempts.append(attempt)
+                        continue
+                    has_bid_ask = entry_bar.ask is not None and entry_bar.bid is not None and all(bar.bid is not None for bar in bars)
+                    if has_bid_ask:
+                        bid, ask = Decimal(entry_bar.bid), Decimal(entry_bar.ask)
+                        if bid <= 0 or ask < bid:
+                            attempt["reason"] = "INVALID_HISTORICAL_BID_ASK"
+                            attempts.append(attempt)
                             continue
-                        has_bid_ask = bars[0].ask is not None and bars[0].bid is not None and all(bar.bid is not None for bar in bars)
-                        if has_bid_ask:
-                            midpoint = (Decimal(bars[0].ask) + Decimal(bars[0].bid)) / 2
-                            spread_pct = (Decimal(bars[0].ask) - Decimal(bars[0].bid)) / midpoint * 100 if midpoint else Decimal("999")
-                            if spread_pct > maximum_spread_pct:
-                                warnings.add(f"{event['code']}: option entry rejected above maximum spread")
-                                continue
-                        chosen = instrument, moneyness, bars, has_bid_ask
-                        break
+                        midpoint = (ask + bid) / 2
+                        spread_pct = (ask - bid) / midpoint * 100 if midpoint else Decimal("999")
+                        if spread_pct > maximum_spread_pct:
+                            attempt["reason"] = "SPREAD_ABOVE_MAXIMUM"
+                            attempt["spread_pct"] = str(spread_pct)
+                            attempts.append(attempt)
+                            continue
+                    attempt["reason"] = "PASSED"
+                    attempts.append(attempt)
+                    chosen = instrument, moneyness, bars, has_bid_ask
+                    break
+                if option_bars_found:
+                    funnel["option_bars_available"] += 1
                 if not chosen:
-                    warnings.add(f"{event['code']}: verified option candles unavailable for some signals")
+                    reason = "LIQUIDITY_CHECK_FAILED" if option_bars_found else "OPTION_ENTRY_BAR_MISSING"
+                    _reject(funnel, stage="liquidity" if option_bars_found else "option_bars", reason=reason, event=event, attempts=attempts)
                     continue
+                funnel["liquidity_passed"] += 1
                 instrument, moneyness, bars, has_bid_ask = chosen
                 base_slip_pct = Decimal(str(config["slippage_pct"]))
                 liquidity_multiplier = Decimal("1")
@@ -200,8 +333,18 @@ def run_backtest_job(db_url: str, run_id: int, model_path: str) -> None:
                 entry = entry_base * (1 + slip)
                 if not has_bid_ask:
                     warnings.add("Real option OHLC was used because historical bid/ask was unavailable; configured slippage was applied on both sides")
+                if position_until and event["time"] <= position_until:
+                    _reject(funnel, stage="risk", reason="POSITION_ALREADY_OPEN", event=event, attempts=attempts)
+                    continue
+                permitted, risk_reason = can_enter(limits=limits, open_positions=0, trades_today=int(day_state["trades"]), consecutive_losses=consecutive_losses, realized_pnl_today=Decimal(day_state["pnl"]), quote_fresh=True, broker_connected=True, reconciled=True)
+                if not permitted:
+                    _reject(funnel, stage="risk", reason=risk_reason.upper().replace(" ", "_").replace("-", "_"), event=event, attempts=attempts)
+                    continue
                 plan = position_size(entry, instrument.lot_size, limits, "BACKTEST")
-                if not plan.allowed: continue
+                if not plan.allowed:
+                    _reject(funnel, stage="risk", reason=plan.reason.upper().replace(" ", "_"), event=event, attempts=attempts)
+                    continue
+                funnel["risk_passed"] += 1
                 underlying_risk = Decimal(str(row.atr))
                 underlying_stop = Decimal(str(row.close)) - underlying_risk if decision.direction == "CE" else Decimal(str(row.close)) + underlying_risk
                 underlying_target = Decimal(str(row.close)) + underlying_risk * limits.reward_risk if decision.direction == "CE" else Decimal(str(row.close)) - underlying_risk * limits.reward_risk
@@ -253,6 +396,7 @@ def run_backtest_job(db_url: str, run_id: int, model_path: str) -> None:
                 )
                 net = gross - charges
                 session.add(BacktestTrade(provider=provider, run_id=run.id, signal_time=event["time"], entry_time=bars[0].timestamp, exit_time=exit_bar.timestamp, underlying_code=event["code"], instrument_key=instrument.instrument_key, option_type=decision.direction, moneyness=moneyness, quantity=plan.quantity, entry_price=entry, exit_price=exit_price, gross_pnl=gross, charges=charges, net_pnl=net, exit_reason=exit_reason, effective_slippage_pct=effective_slip_pct, metadata_source=instrument.metadata_source, resolution_timeframe=resolution_timeframe))
+                funnel["executed_trades"] += 1
                 doubled_entry = entry_base * (1 + slip * 2)
                 doubled_exit = exit_base * (1 - slip * 2)
                 stress_net = (doubled_exit - doubled_entry) * plan.quantity - option_charges(
@@ -272,6 +416,41 @@ def run_backtest_job(db_url: str, run_id: int, model_path: str) -> None:
                     run.progress_percent = min(95, 35 + int(len(recorded) / len(events) * 60))
                     session.commit()
             summary = metrics(recorded, capital)
+            for funnel in funnels.values():
+                funnel["rejections"] = dict(funnel["rejections"])
+            summary["signal_diagnostics"] = {
+                "strategy_mode": strategy_mode,
+                "stages": list(FUNNEL_STAGES),
+                "by_index": funnels,
+                "total": _funnel_totals(funnels),
+                "rule_only_confirmed_signal_baseline": rule_only_baseline if strategy_mode == "MODEL" else None,
+            }
+            summary["replay_assumptions"] = {
+                "strike_policy": strike_policy,
+                "contract_order": ["ATM", "ITM1"] if strike_policy == "ATM_ITM1" else ["ATM"],
+                "otm_enabled": False,
+                "comparable_with_paper_live": [
+                    "direction and confirmation rules",
+                    "non-expiry-day nearest expiry",
+                    "ATM then ITM1 selection",
+                    "option volume",
+                    "open interest when supplied historically",
+                    "bid/ask spread when supplied historically",
+                    "risk limits and whole-lot sizing",
+                ],
+                "unavailable_historically": [
+                    "quote age",
+                    "option delta",
+                    "order-book depth",
+                    "broker fill latency",
+                ],
+                "bid_ask_fallback": "Option OHLC plus configured two-sided slippage when historical bid/ask is unavailable",
+            }
+            if not recorded:
+                if not events:
+                    warnings.add("No signal passed the strategy rules; inspect model confidence and directional predictions")
+                else:
+                    warnings.add("Signals occurred, but no valid option trade passed contract, liquidity, and risk checks")
             summary["double_slippage_net_pnl"] = float(sum((row["stress_net_pnl"] for row in recorded), Decimal("0")))
             run.summary_json = json.dumps(summary)
             run.warnings_json = json.dumps(sorted(warnings))

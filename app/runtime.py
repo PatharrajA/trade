@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -22,6 +23,9 @@ from .telegram import enqueue
 from .training import front_future_frame
 
 
+logger = logging.getLogger(__name__)
+
+
 class RuntimeService:
     def __init__(self, market_brokers: dict[str, BrokerClient], trading_brokers: dict[str, BrokerClient], session_factory) -> None:
         self.market_brokers = market_brokers
@@ -36,6 +40,7 @@ class RuntimeService:
         self.last_error: str | None = None
         self.last_report_day: date | None = None
         self.last_reconcile_at: datetime | None = None
+        self.invalid_candle_alerts: set[tuple[str, str, date]] = set()
 
     def _active_provider(self, session) -> str:
         return provider_name(settings_dict(session).get("active_broker"))
@@ -45,10 +50,59 @@ class RuntimeService:
         self.model = RegimeModel(config.model_path)
 
     @staticmethod
-    def _parse(raw: list) -> tuple[datetime, Decimal, Decimal, Decimal, Decimal, int, int]:
-        stamp = datetime.fromisoformat(str(raw[0]).replace("Z", "+00:00"))
-        if stamp.tzinfo is None: stamp = stamp.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
-        return stamp.astimezone(UTC), *(Decimal(str(raw[index])) for index in range(1, 5)), int(raw[5] or 0), int(raw[6] or 0) if len(raw) > 6 else 0
+    def _record_signal_rejection(session, *, provider: str, mode: str, code: str, stamp: datetime, stage: str, reason: str, decision=None, details: dict | None = None) -> None:
+        signal_id = f"reject-{provider.lower()}-{code.lower()}-{int(stamp.timestamp())}-{stage.lower()}"[:64]
+        if session.get(Signal, signal_id):
+            return
+        session.add(Signal(
+            provider=provider,
+            id=signal_id,
+            mode=mode,
+            underlying_code=code,
+            candle_timestamp=stamp,
+            direction=getattr(decision, "direction", "NO_TRADE"),
+            regime=getattr(decision, "regime", "UNAVAILABLE"),
+            confidence=float(getattr(decision, "confidence", 0)),
+            status="REJECTED",
+            rejection_reason=reason,
+            decision_json=json.dumps({"stage": stage, **(details or {})}, default=str, sort_keys=True),
+        ))
+
+    @staticmethod
+    def _parse(raw: list) -> tuple[datetime, Decimal, Decimal, Decimal, Decimal, int, int] | None:
+        """Reject malformed broker candles without taking down the trading loop."""
+        try:
+            stamp = datetime.fromisoformat(str(raw[0]).replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+            open_, high, low, close = (Decimal(str(raw[index])) for index in range(1, 5))
+            volume = int(raw[5] or 0)
+            oi = int(raw[6] or 0) if len(raw) > 6 else 0
+        except (IndexError, TypeError, ValueError, InvalidOperation, OverflowError):
+            return None
+        if (
+            not all(value.is_finite() and value > 0 for value in (open_, high, low, close))
+            or high < max(open_, close, low)
+            or low > min(open_, close)
+            or volume < 0
+            or oi < 0
+        ):
+            return None
+        return stamp.astimezone(UTC), open_, high, low, close, volume, oi
+
+    def _valid_candles(self, rows: list[list], provider: str, code: str) -> list[tuple]:
+        parsed = [candle for row in rows if (candle := self._parse(row)) is not None]
+        rejected = len(rows) - len(parsed)
+        alert = (provider, code, date.today())
+        if rejected and alert not in self.invalid_candle_alerts:
+            with self.session_factory() as session:
+                session.add(SystemEvent(
+                    severity="WARNING", component=provider, event_type="INVALID_CANDLE",
+                    message=f"{code}: skipped {rejected} malformed historical candles",
+                ))
+                session.commit()
+            self.invalid_candle_alerts.add(alert)
+        return sorted(parsed, key=lambda candle: candle[0])
 
     @staticmethod
     def _db_stamp(value: datetime) -> datetime:
@@ -162,8 +216,9 @@ class RuntimeService:
             key = broker.index_key(code)
             rows = await broker.historical_candles(key, date.today() - timedelta(days=3), date.today())
             if not rows: continue
-            parsed = [self._parse(row) for row in rows]
-            parsed.sort(key=lambda row: row[0])
+            parsed = self._valid_candles(rows, provider, code)
+            if not parsed:
+                continue
             latest = parsed[-1]
             context = await broker.market_context(key, latest[4])
             with self.session_factory() as session:
@@ -184,7 +239,7 @@ class RuntimeService:
                 future_rows = await broker.historical_candles(
                     future.instrument_key, date.today() - timedelta(days=3), date.today()
                 )
-                future_parsed = sorted((self._parse(row) for row in future_rows), key=lambda row: row[0])
+                future_parsed = self._valid_candles(future_rows, provider, code)
                 if future_parsed:
                     with self.session_factory() as session:
                         existing_future = session.scalar(
@@ -237,11 +292,15 @@ class RuntimeService:
             candidates = []
             for code in settings["enabled_indices"].split(","):
                 rows = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == code, Candle.data_role == "SPOT", Candle.timeframe == "5minute", Candle.timestamp < boundary).order_by(Candle.timestamp.desc()).limit(80)).all()[::-1]
-                if len(rows) < 50: continue
+                if len(rows) < 50:
+                    self._record_signal_rejection(session, provider=provider, mode=runtime.execution_mode, code=code, stamp=boundary, stage="MARKET_DATA", reason="Insufficient spot history", details={"available_bars": len(rows), "required_bars": 50})
+                    continue
                 future_rows = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == code, Candle.data_role == "FUTURE", Candle.timeframe == "5minute", Candle.timestamp < boundary).order_by(Candle.timestamp.desc()).limit(240)).all()
                 future_instruments = session.scalars(select(Instrument).where(Instrument.provider == provider, Instrument.underlying_code == code, Instrument.instrument_kind == "FUTURE")).all()
                 futures_frame = front_future_frame(future_rows, future_instruments)
-                if len(futures_frame) < 50: continue
+                if len(futures_frame) < 50:
+                    self._record_signal_rejection(session, provider=provider, mode=runtime.execution_mode, code=code, stamp=boundary, stage="MARKET_DATA", reason="Insufficient aligned futures history", details={"available_bars": len(futures_frame), "required_bars": 50})
+                    continue
                 frame = with_futures_features(
                     pd.DataFrame([{"timestamp": item.timestamp, "open": float(item.open), "high": float(item.high), "low": float(item.low), "close": float(item.close), "volume": item.volume} for item in rows]),
                     futures_frame,
@@ -257,7 +316,9 @@ class RuntimeService:
                 expiries = sorted({item.expiry for item in contracts if item.expiry > date.today()})
                 chain = [item for item in contracts if expiries and item.expiry == expiries[0]]
                 strikes = sorted({item.strike for item in chain})
-                if not strikes: continue
+                if not strikes:
+                    self._record_signal_rejection(session, provider=provider, mode=runtime.execution_mode, code=code, stamp=candle.timestamp, stage="CONTRACT", reason="No eligible non-expiry-day option contract", decision=decision)
+                    continue
                 spot = Decimal(candle.close)
                 atm = min(strikes, key=lambda value: abs(value - spot)); idx = strikes.index(atm)
                 itm = strikes[max(0, idx - 1)] if decision.direction == "CE" else strikes[min(len(strikes) - 1, idx + 1)]
@@ -268,6 +329,8 @@ class RuntimeService:
                     spread = float((selection.quote.ask - selection.quote.bid) / ((selection.quote.ask + selection.quote.bid) / 2) * 100)
                     score = decision.confidence - spread * 0.02 + min(selection.quote.volume / 100000, 1) * 0.08
                     candidates.append((score, code, candle, decision, selection, frame.iloc[-1]))
+                else:
+                    self._record_signal_rejection(session, provider=provider, mode=runtime.execution_mode, code=code, stamp=candle.timestamp, stage="OPTION_FILTERS", reason=selection.reason, decision=decision, details={"candidate_strikes": [str(atm), str(itm)], "otm_enabled": False})
             session.commit()
             if not candidates: return
             candidates.sort(key=lambda item: item[0], reverse=True)
@@ -395,14 +458,15 @@ class RuntimeService:
                 self.last_error = None
             except asyncio.CancelledError: raise
             except Exception as exc:
-                self.last_error = str(exc)
+                logger.exception("Trading loop failed")
+                self.last_error = f"{type(exc).__name__}: {exc}"
                 with self.session_factory() as session:
                     runtime = session.get(RuntimeSetting, 1)
                     if runtime and runtime.execution_mode == "LIVE":
                         runtime.entries_paused = True
                     provider = self._active_provider(session)
-                    session.add(SystemEvent(severity="ERROR", component=provider, event_type="LOOP_ERROR", message=str(exc)))
-                    enqueue(session, "OWNER", "BROKER_CONNECTION_ERROR", f"{provider} connection failed: {exc}", f"broker-error:{provider}:{date.today().isoformat()}")
+                    session.add(SystemEvent(severity="ERROR", component=provider, event_type="LOOP_ERROR", message=self.last_error))
+                    enqueue(session, "OWNER", "BROKER_CONNECTION_ERROR", f"{provider} connection failed: {self.last_error}", f"broker-error:{provider}:{date.today().isoformat()}")
                     session.commit()
             await asyncio.sleep(1)
 
