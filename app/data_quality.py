@@ -75,11 +75,13 @@ def _utc_naive(value: datetime) -> datetime:
 
 
 INDIA_TIME = ZoneInfo("Asia/Kolkata")
-REGULAR_SESSION = ((time(9, 15), time(15, 30)),)
+# Candle timestamps are bar starts. For five-minute data, the last regular bar
+# starts at 15:25 and covers the interval through the 15:30 market close.
+REGULAR_SESSION = ((time(9, 15), time(15, 25)),)
 # NSE/MSD/60677 and NSE/MSD/61893 scheduled a midday DR-site switchover.
 SPECIAL_SESSIONS = {
-    date(2024, 3, 2): ((time(9, 15), time(10, 0)), (time(11, 30), time(12, 30))),
-    date(2024, 5, 18): ((time(9, 15), time(10, 0)), (time(11, 30), time(12, 30))),
+    date(2024, 3, 2): ((time(9, 15), time(9, 55)), (time(11, 30), time(12, 25))),
+    date(2024, 5, 18): ((time(9, 15), time(9, 55)), (time(11, 30), time(12, 25))),
 }
 
 

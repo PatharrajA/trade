@@ -84,3 +84,11 @@ def test_missing_bars_excludes_preopen_and_special_session_breaks():
         datetime(2025, 1, 2, 3, 45, tzinfo=UTC),
         datetime(2025, 1, 2, 3, 55, tzinfo=UTC),
     ]) == 1
+
+
+def test_missing_bars_does_not_expect_a_bar_starting_at_market_close():
+    # Five-minute timestamps are bar starts: 15:25 is the final regular bar.
+    assert _missing_intervals([
+        datetime(2025, 1, 2, 9, 55, tzinfo=UTC),  # 15:25 IST
+        datetime(2025, 1, 2, 10, 10, tzinfo=UTC),  # broker post-close snapshot
+    ]) == 0
