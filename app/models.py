@@ -244,6 +244,46 @@ class ModelArtifact(Base):
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class ShadowObservation(Base):
+    __tablename__ = "shadow_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "model_version", "underlying_code", "signal_time", name="uq_shadow_model_signal"
+        ),
+        Index("ix_shadow_status_time", "status", "signal_time"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider: Mapped[str] = mapped_column(String(16), index=True)
+    model_version: Mapped[str] = mapped_column(String(64), index=True)
+    underlying_code: Mapped[str] = mapped_column(String(24), index=True)
+    signal_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    direction: Mapped[str] = mapped_column(String(2))
+    setup_type: Mapped[str] = mapped_column(String(48))
+    probability: Mapped[float] = mapped_column(Float)
+    decision: Mapped[str] = mapped_column(String(8), index=True)
+    threshold: Mapped[float] = mapped_column(Float)
+    instrument_key: Mapped[str | None] = mapped_column(String(100))
+    trading_symbol: Mapped[str | None] = mapped_column(String(100))
+    moneyness: Mapped[str | None] = mapped_column(String(8))
+    lot_size: Mapped[int | None] = mapped_column(Integer)
+    underlying_entry: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    underlying_stop: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    underlying_target: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    option_entry: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    option_exit: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    gross_pnl: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    charges: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    net_pnl: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    status: Mapped[str] = mapped_column(String(16), default="OPEN", index=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text)
+    exit_reason: Mapped[str | None] = mapped_column(String(48))
+    timeout_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    details_json: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class NotificationOutbox(Base):
     __tablename__ = "notification_outbox"
     __table_args__ = (UniqueConstraint("dedupe_key", name="uq_notification_dedupe"),)

@@ -84,22 +84,39 @@ Tokens are stored in `data/secrets/` with `0600` permissions. Do not commit or s
 
 Use the Backtests page in this order. Download, training and replay automatically use the broker selected in Settings:
 
-1. Download verified five-minute history. The application always requests both spot-index and aligned index-futures candles; enable the option checkbox when historical CE/PE P&L is required.
-2. Train a candidate XGBoost model. Candidate files are kept under `models/candidates/`; training does not silently replace the active model.
-3. Confirm that the Backtests screen shows enough verified futures candles and, for trade replay, verified historical option candles.
-4. Review its chronological validation metrics, confusion matrix, confidence distribution and feature importance, then explicitly activate it. Validation holds out complete trading days with a one-day gap from training and reports directional precision at several confidence thresholds. After scoring, the saved candidate is fitted again on the full requested period; its validation metrics describe the earlier holdout fit. Activation atomically updates the single common `models/regime.json` and archives the previous version.
-5. Run a backtest beginning after the model training end date. Run the same period with **Rule-only comparison** to check whether the model adds value.
-6. Review warnings, P&L, drawdown, monthly/exit/strike/side breakdowns, doubled-slippage stress and exported CSV trades.
+1. Download verified five-minute spot, futures and expired-option history for NIFTY, BANK NIFTY and SENSEX.
+2. Train the recommended separate TAKE/SKIP setup-quality models. Candidate bundles are kept under `models/candidates/`; training does not silently enable execution.
+3. Use **Check training data** with the same indices and Fit/Tune/Holdout dates before training. It counts rule candidates and verified option-price labels for each index and period, shows the first missing contract or option-bar examples, and makes no model or trading changes. Confirm that every period reaches at least 90% option-label coverage and has enough candidates.
+4. Review the chronological fit, tuning, untouched holdout and walk-forward results.
+5. Run a post-holdout option backtest with **Rule-only comparison** enabled.
+6. Review P&L, profit factor, expectancy, drawdown, monthly stability, rejection stages and doubled-slippage stress before enabling shadow mode.
 
-Historical data is always provider-tagged. A Groww backtest cannot accidentally consume Upstox candles and vice versa. The UI submits the active broker on every research step. Model files are deliberately not provider-specific because both feeds are normalized to the same `spot-futures-v2` feature schema. The training provider, date coverage and validation metrics remain recorded in common model metadata for auditability.
+Historical data is always provider-tagged. A Groww backtest cannot accidentally consume Upstox candles and vice versa. Legacy direction-model files and routes remain readable for old records, but they are not shown in the recommended workflow and are not used as a Paper/Live execution fallback.
 
 The engine never synthesizes option premiums from index prices. When historical bid/ask is unavailable, it uses verified option OHLC with configured two-sided slippage and reports the limitation. A historical Groww symbol may be downloaded even when it has disappeared from today's instrument master, but it is marked unverified and excluded from P&L until its historical lot size is known.
 
 Backtests fail with an explicit data reason when the selected period has no option candles linked to verified historical contract metadata. A completed zero-trade run reports the number of evaluated bars, confident model predictions and confirmed signals. Do not lower the confidence gate based only on the number of signals; compare directional precision and after-cost option P&L on unseen dates first.
 
+### Recommended TAKE/SKIP setup-quality model
+
+The Backtests page exposes only the recommended setup-quality trainer. Activation remains an explicit, gated action:
+
+1. The existing futures-VWAP, EMA9/EMA20 and opening-range rules determine CE or PE.
+2. Only a newly confirmed rule transition becomes a candidate; consecutive candles in the same active breakout are not duplicated.
+3. Each candidate enters on the next five-minute bar and receives a conservative triple-barrier label: 1 ATR stop, 1.5 ATR target and nine-bar timeout. A candle touching stop and target is excluded because the order is unknown without one-minute data.
+4. One training job saves a single bundle containing separate NIFTY, BANK NIFTY and SENSEX binary XGBoost components. SENSEX uses NIFTY as its relative-strength reference. The default form uses 2023-2024 for fitting, the first half of 2025 for tuning/calibration and the second half of 2025 as a locked holdout.
+5. Features include multi-horizon momentum, EMA slopes, ATR, VWAP/opening-range/day-range distances, futures basis changes, opening gap, NIFTY-versus-BANK-NIFTY relative strength, previous-day position, futures-expiry distance, optional India VIX with an availability flag, cyclical time and time buckets.
+6. Holdout reporting compares model-selected TAKE candidates, model SKIP candidates and the rules-only baseline using coverage, TAKE precision, profit factor, expectancy, drawdown, monthly concentration, CE/PE results and confidence bands. Three expanding walk-forward folds are also recorded.
+
+When at least 90% of rule candidates have verified option candles and dated contract metadata, training uses the historical ATM→ITM1 option entry/exit, bid/ask when available, two-sided slippage and the normal Indian charge model. Otherwise the label source is explicitly recorded as `UNDERLYING_TRIPLE_BARRIER_PROXY` and activation remains blocked.
+
+A saved TAKE/SKIP bundle can be selected for a post-holdout option replay from the normal Backtest form. It can also be enabled in **shadow** mode: the live rule/model/contract path records both TAKE and SKIP hypothetical outcomes in `shadow_observations`, but never creates an `Order` or `Trade`. Paper/Live setup execution requires a completed post-holdout option replay paired with rule-only comparison, positive after-cost results for every included index, model profit factor of at least 1.20, positive expectancy, and positive net P&L under double slippage. Shadow validation is assessed separately for every included index: at least 100 closed TAKE outcomes across 20 trading sessions, at least 55% TAKE win rate, profit factor of at least 1.20, positive expectancy, and TAKE profit factor above SKIP when both are available. The shadow dashboard reports all observations for the selected model and broker, with per-index and confidence/time/contract breakdowns. Until these gates pass, Paper/Live model execution remains unavailable.
+
 For pending Groww metadata, export the CSV from **Backtests → Historical contract metadata**, fill lot size and tick size from a trustworthy broker/exchange archive, and import it. The importer only updates already-downloaded matching contracts and records `CSV_IMPORT` as the source.
 
 Research downloads run in the application background. The run and its progress survive page navigation. If the process stops, the run is marked interrupted; submit the same provider, indices and dates again to resume because candle uniqueness prevents duplicate storage. The provider may still be queried for an existing date chunk, but existing rows are not inserted twice.
+
+Repair mode resolves gap dates from the combined spot or futures series, then re-requests those complete trading days for every applicable stored futures contract. A repair run is marked `PARTIAL`, rather than `COMPLETE`, when the provider still omits one or more expected candles. This distinguishes a genuine upstream archive gap from a successful repair.
 
 ### Switching after a one-month Groww subscription
 

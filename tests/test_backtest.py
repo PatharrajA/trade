@@ -1,7 +1,7 @@
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from app.backtest import _intrabar_underlying_outcome, metrics, option_replay_issue
+from app.backtest import _intrabar_underlying_outcome, metrics, option_replay_issue, setup_replay_quality_issues
 from app.models import Candle, Instrument
 
 
@@ -54,3 +54,17 @@ def test_option_replay_requires_matching_historical_metadata(session):
     contract.metadata_verified = True
     session.commit()
     assert option_replay_issue(session, "GROWW", "NIFTY", day, day) is None
+
+
+def test_setup_replay_gate_checks_each_index_and_slippage_stress():
+    model = {
+        "trades": 120, "profit_factor": 1.4, "expectancy": 25,
+        "double_slippage_net_pnl": 500, "per_index": {"NIFTY": 1000, "SENSEX": -100},
+    }
+    baseline = {"trades": 160, "profit_factor": 1.1}
+
+    issues = setup_replay_quality_issues(model, baseline, ["NIFTY", "SENSEX"])
+
+    assert issues == ["SENSEX: replay net P&L is not positive"]
+    model["per_index"]["SENSEX"] = 200
+    assert setup_replay_quality_issues(model, baseline, ["NIFTY", "SENSEX"]) == []

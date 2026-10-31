@@ -65,6 +65,10 @@ DEFAULTS = {
     "enforce_paper_session_requirement": "true",
     "required_paper_sessions": "20",
     "static_ip_verified": "false",
+    "setup_shadow_enabled": "false",
+    "setup_shadow_model_path": "",
+    "setup_execution_enabled": "false",
+    "setup_execution_model_path": "",
 }
 
 

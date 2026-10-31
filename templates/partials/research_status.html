@@ -1,4 +1,4 @@
-<div id="research-run-{{ run.id }}" class="run-item" {% if run.status in ['QUEUED','RUNNING'] %}hx-get="/backtests/research/{{ run.id }}/status" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+<div id="research-run-{{ run.id }}" class="run-item" {% if run.status in ['QUEUED','RUNNING'] %}data-poll-url="/backtests/research/{{ run.id }}/status"{% endif %}>
   <div><b>#{{ run.id }} · {{ run.provider }}</b><small>{{ run.current_step }}{% if run.error_message %} · {{ run.error_message }}{% endif %}</small><div class="progress"><i style="width:{{ run.progress_percent }}%"></i></div></div>
   <span class="status {{ 'green' if run.status == 'COMPLETE' else ('red' if run.status in ['FAILED','PARTIAL'] else 'amber') }}">{{ run.status }} · {{ run.progress_percent }}%</span>
 </div>

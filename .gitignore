@@ -10,3 +10,4 @@ data/backups/
 data/secrets/
 models/*.json
 models/*
+*DS_Store

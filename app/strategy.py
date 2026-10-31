@@ -19,10 +19,13 @@ FEATURES = [
 PRICE_FEATURES = [
     "vwap_distance", "ema9_20_distance", "ema20_50_distance", "atr_pct", "rsi", "volume_ratio",
     "previous_day_high_distance", "previous_day_low_distance", "previous_day_close_distance",
+    "return_1", "return_3", "return_6", "return_12", "ema9_slope", "atr_change",
+    "opening_range_high_distance", "opening_range_low_distance", "futures_basis_pct",
     "minutes_from_open",
 ]
 
-FEATURE_SCHEMA = "spot-futures-v2"
+FEATURE_SCHEMA = "spot-futures-v3"
+SUPPORTED_FEATURE_SCHEMAS = {"spot-futures-v2", FEATURE_SCHEMA}
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,16 @@ def indicators(candles: pd.DataFrame) -> pd.DataFrame:
     opening = local.dt.time <= pd.Timestamp("09:30").time()
     frame["opening_range_high"] = frame.high.where(opening).groupby(day).transform("max")
     frame["opening_range_low"] = frame.low.where(opening).groupby(day).transform("min")
+    for bars in (1, 3, 6, 12):
+        frame[f"return_{bars}"] = frame.close.groupby(day).pct_change(bars).fillna(0.0)
+    frame["ema9_slope"] = frame.ema9.groupby(day).pct_change(3).fillna(0.0)
+    frame["atr_change"] = frame.atr.groupby(day).pct_change(6).fillna(0.0)
+    frame["opening_range_high_distance"] = (
+        frame.close - frame.opening_range_high
+    ) / frame.close.replace(0, np.nan)
+    frame["opening_range_low_distance"] = (
+        frame.close - frame.opening_range_low
+    ) / frame.close.replace(0, np.nan)
     daily = frame.assign(trading_day=day).groupby("trading_day").agg(day_high=("high", "max"), day_low=("low", "min"), day_close=("close", "last")).shift(1)
     frame["previous_day_high"] = day.map(daily.day_high)
     frame["previous_day_low"] = day.map(daily.day_low)
@@ -93,7 +106,7 @@ class RegimeModel:
         metadata_path = path.with_name(f"{path.stem}.metadata.json")
         if path.exists() and metadata_path.exists():
             self.metadata = json.loads(metadata_path.read_text())
-            if self.metadata.get("feature_schema") != FEATURE_SCHEMA:
+            if self.metadata.get("feature_schema") not in SUPPORTED_FEATURE_SCHEMAS:
                 return
             import xgboost as xgb
 
@@ -102,6 +115,9 @@ class RegimeModel:
             model = xgb.Booster()
             model.load_model(path)
             self.model = model
+        self.probability_temperature = max(
+            0.05, float(self.metadata.get("probability_temperature", 1.0))
+        )
 
     @property
     def available(self) -> bool:
@@ -116,6 +132,12 @@ class RegimeModel:
         import xgboost as xgb
 
         probabilities = self.model.predict(xgb.DMatrix(matrix, feature_names=self.required_features))[0]
+        if self.probability_temperature != 1.0:
+            powered = np.power(
+                np.clip(probabilities, 1e-12, 1.0),
+                1.0 / self.probability_temperature,
+            )
+            probabilities = powered / powered.sum()
         best = int(np.argmax(probabilities))
         if best >= len(self.classes):
             return "UNCERTAIN", 0.0
@@ -138,8 +160,16 @@ def feature_values(row: pd.Series, context: dict[str, float | None] | None = Non
         "previous_day_high_distance": (close - float(row.previous_day_high)) / close,
         "previous_day_low_distance": (close - float(row.previous_day_low)) / close,
         "previous_day_close_distance": (close - float(row.previous_day_close)) / close,
+        "return_1": float(row.get("return_1", np.nan)),
+        "return_3": float(row.get("return_3", np.nan)),
+        "return_6": float(row.get("return_6", np.nan)),
+        "return_12": float(row.get("return_12", np.nan)),
+        "ema9_slope": float(row.get("ema9_slope", np.nan)),
+        "atr_change": float(row.get("atr_change", np.nan)),
+        "opening_range_high_distance": float(row.get("opening_range_high_distance", np.nan)),
+        "opening_range_low_distance": float(row.get("opening_range_low_distance", np.nan)),
         "india_vix": float(context.get("india_vix") or np.nan),
-        "futures_basis_pct": float(context.get("futures_basis_pct") or np.nan),
+        "futures_basis_pct": float(row.get("futures_basis_pct", context.get("futures_basis_pct") or np.nan)),
         "pcr": float(context.get("pcr") or np.nan),
         "minutes_from_open": float(stamp.hour * 60 + stamp.minute - 555),
     }

@@ -97,6 +97,17 @@ def _known_gap_count(
     start: date,
     end: date,
 ) -> int:
+    return len(_known_gap_timestamps(session_factory, provider, underlying_code, data_role, start, end))
+
+
+def _known_gap_timestamps(
+    session_factory,
+    provider: str,
+    underlying_code: str,
+    data_role: str,
+    start: date,
+    end: date,
+) -> list[datetime]:
     with session_factory() as session:
         values = session.scalars(
             select(Candle.timestamp)
@@ -111,7 +122,23 @@ def _known_gap_count(
             )
             .order_by(Candle.timestamp)
         ).all()
-    return len(_missing_timestamps(list(values)))
+    return _missing_timestamps(list(values))
+
+
+def _known_gap_days(
+    session_factory,
+    provider: str,
+    underlying_code: str,
+    data_role: str,
+    start: date,
+    end: date,
+) -> set[date]:
+    return {
+        stamp.astimezone(ZoneInfo("Asia/Kolkata")).date()
+        for stamp in _known_gap_timestamps(
+            session_factory, provider, underlying_code, data_role, start, end
+        )
+    }
 
 
 async def _store_candles(
@@ -127,6 +154,7 @@ async def _store_candles(
     data_role: str = "SPOT",
     minutes: int = 5,
     repair_only: bool = False,
+    repair_dates: set[date] | None = None,
     warnings: list[str] | None = None,
 ) -> int:
     inserted = 0
@@ -147,11 +175,18 @@ async def _store_candles(
                 .order_by(Candle.timestamp)
             ).all()
         if stored:
-            gap_days = sorted({
-                stamp.astimezone(ZoneInfo("Asia/Kolkata")).date()
-                for stamp in _missing_timestamps(list(stored), minutes)
-                if start <= stamp.astimezone(ZoneInfo("Asia/Kolkata")).date() <= end
-            })
+            gap_days = sorted(
+                day
+                for day in (
+                    repair_dates
+                    if repair_dates is not None
+                    else {
+                        stamp.astimezone(ZoneInfo("Asia/Kolkata")).date()
+                        for stamp in _missing_timestamps(list(stored), minutes)
+                    }
+                )
+                if start <= day <= end
+            )
             ranges = [(day, day) for day in gap_days]
     for chunk_start, chunk_end in ranges:
         rows = (
@@ -277,6 +312,42 @@ def _contract_choices(contracts: list[Contract], spot: Decimal) -> list[Contract
     return selected
 
 
+def _repair_issues(
+    session_factory,
+    provider: str,
+    indices: list[str],
+    start: date,
+    end: date,
+    *,
+    check_option_metadata: bool,
+) -> list[str]:
+    issues: list[str] = []
+    for code in indices:
+        for role in ("SPOT", "FUTURE"):
+            remaining = _known_gap_count(
+                session_factory, provider, code, role, start, end
+            )
+            if remaining:
+                issues.append(
+                    f"{code}: {remaining} known {role.lower()} intraday gaps remain after repair"
+                )
+        if check_option_metadata:
+            with session_factory() as session:
+                pending_metadata = session.scalar(
+                    select(Instrument.id).where(
+                        Instrument.provider == provider,
+                        Instrument.underlying_code == code,
+                        Instrument.instrument_kind == "OPTION",
+                        Instrument.metadata_verified.is_(False),
+                    ).limit(1)
+                )
+            if pending_metadata:
+                issues.append(
+                    f"{code}: historical option lot/tick metadata still requires verification"
+                )
+    return issues
+
+
 async def sync_research_data(
     client: BrokerClient,
     session_factory,
@@ -333,6 +404,13 @@ async def sync_research_data(
 
     expiry_end = min(date.today(), end + timedelta(days=45))
     for code in indices:
+        futures_repair_dates = (
+            _known_gap_days(
+                session_factory, provider, code, "FUTURE", start, end
+            )
+            if repair_only
+            else None
+        )
         try:
             expiries = await client.historical_expiries(code, start, expiry_end)
         except Exception as exc:
@@ -362,6 +440,7 @@ async def sync_research_data(
                     contract=contract,
                     data_role="FUTURE",
                     repair_only=repair_only,
+                    repair_dates=futures_repair_dates,
                     warnings=warnings,
                 )
                 with session_factory() as session:
@@ -390,6 +469,22 @@ async def sync_research_data(
             await progress(completed_steps, total_steps, f"{code}: futures history stored")
 
     if not include_options:
+        incomplete_reasons.extend(
+            f"{code}: no verified {provider} futures candles are available for the requested period"
+            for code in indices
+            if not _has_candles(session_factory, provider, code, "FUTURE", start, end)
+        )
+        if repair_only:
+            incomplete_reasons.extend(
+                _repair_issues(
+                    session_factory,
+                    provider,
+                    indices,
+                    start,
+                    end,
+                    check_option_metadata=False,
+                )
+            )
         return SyncResult(
             underlying_count,
             futures_count,
@@ -397,11 +492,7 @@ async def sync_research_data(
             futures_contract_count,
             0,
             warnings,
-            [
-                f"{code}: no verified {provider} futures candles are available for the requested period"
-                for code in indices
-                if not _has_candles(session_factory, provider, code, "FUTURE", start, end)
-            ],
+            incomplete_reasons,
         )
 
     for code in indices:
@@ -433,6 +524,7 @@ async def sync_research_data(
             continue
         contracts_by_expiry: dict[date, list[Contract]] = {}
         selected: dict[str, Contract] = {}
+        first_selected_day: dict[str, date] = {}
         daily_spot: dict[date, Decimal] = {}
         for row in underlying_rows:
             stamp = row.timestamp.replace(tzinfo=UTC) if row.timestamp.tzinfo is None else row.timestamp.astimezone(UTC)
@@ -444,9 +536,15 @@ async def sync_research_data(
                 continue
             expiry = min(eligible)
             if expiry not in contracts_by_expiry:
+                if progress:
+                    await progress(
+                        completed_steps, total_steps,
+                        f"{code}: discovering option contracts for {expiry}",
+                    )
                 contracts_by_expiry[expiry] = await client.historical_contracts(code, expiry)
             for contract in _contract_choices(contracts_by_expiry[expiry], spot):
                 selected[contract.instrument_key] = contract
+                first_selected_day.setdefault(contract.instrument_key, trading_day)
 
         if not selected:
             warning = f"{code}: no historical ATM/ITM1 contracts were resolved from {provider}"
@@ -455,16 +553,24 @@ async def sync_research_data(
             warnings.append(warning)
             continue
 
-        for contract in selected.values():
+        contract_total = len(selected)
+        for contract_number, contract in enumerate(selected.values(), start=1):
+            if progress:
+                await progress(
+                    completed_steps * 100 + 100 * (contract_number - 1) // contract_total,
+                    total_steps * 100,
+                    f"{code}: downloading option contracts {contract_number}/{contract_total}",
+                )
             candle_end = min(end, contract.expiry)
-            if candle_end < start:
+            contract_start = max(start, first_selected_day[contract.instrument_key])
+            if candle_end < contract_start:
                 continue
             count = await _store_candles(
                 client,
                 session_factory,
                 contract.instrument_key,
                 code,
-                start,
+                contract_start,
                 candle_end,
                 provider=provider,
                 contract=contract,
@@ -507,26 +613,17 @@ async def sync_research_data(
             incomplete_reasons.append(
                 f"{code}: no verified {provider} option candles are available for the requested period"
             )
-        if repair_only:
-            for role in ("SPOT", "FUTURE"):
-                remaining = _known_gap_count(session_factory, provider, code, role, start, end)
-                if remaining:
-                    incomplete_reasons.append(
-                        f"{code}: {remaining} known {role.lower()} intraday gaps remain after repair"
-                    )
-            with session_factory() as session:
-                pending_metadata = session.scalar(
-                    select(Instrument.id).where(
-                        Instrument.provider == provider,
-                        Instrument.underlying_code == code,
-                        Instrument.instrument_kind == "OPTION",
-                        Instrument.metadata_verified.is_(False),
-                    ).limit(1)
-                )
-            if pending_metadata:
-                incomplete_reasons.append(
-                    f"{code}: historical option lot/tick metadata still requires verification"
-                )
+    if repair_only:
+        incomplete_reasons.extend(
+            _repair_issues(
+                session_factory,
+                provider,
+                indices,
+                start,
+                end,
+                check_option_metadata=True,
+            )
+        )
     return SyncResult(
         underlying_count,
         futures_count,

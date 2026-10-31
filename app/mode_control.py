@@ -49,6 +49,8 @@ async def change_mode(
     if runtime.execution_mode == "LIVE" and target != "LIVE" and (unresolved or live_trade):
         return False, "Exit or reconcile the live position/order before leaving LIVE"
     if target == "PAPER":
+        if model_available is False:
+            return False, "Enable an approved TAKE/SKIP model before starting Paper trading"
         market_connected, detail = await market_broker.market_data_health()
         if not market_connected:
             return False, f"Paper mode requires valid {market_provider} market-data access: {detail}"

@@ -17,7 +17,8 @@ from sqlalchemy.orm import Session
 from .data_quality import option_replay_issue
 from .models import BacktestRun, BacktestTrade, Candle, Instrument
 from .risk import RiskLimits, can_enter, option_charges, position_size
-from .strategy import RegimeModel, decide, rule_only_decide, with_futures_features
+from .setup_quality import SETUP_FEATURES, SetupQualityModel, relative_index_code, setup_rule_candidates
+from .strategy import Decision, RegimeModel, decide, rule_only_decide, with_futures_features
 from .training import front_future_frame
 
 
@@ -32,6 +33,29 @@ FUNNEL_STAGES = (
     "risk_passed",
     "executed_trades",
 )
+
+
+def setup_replay_quality_issues(summary: dict, baseline: dict, indices: list[str]) -> list[str]:
+    """Require a real after-cost option replay for every component in a bundle."""
+    issues: list[str] = []
+    if int(summary.get("trades") or 0) == 0:
+        issues.append("model replay has no executed option trades")
+    if summary.get("profit_factor") is None or float(summary["profit_factor"]) < 1.20:
+        issues.append("model replay profit factor is below 1.20")
+    if float(summary.get("expectancy") or 0) <= 0:
+        issues.append("model replay expectancy is not positive")
+    if float(summary.get("double_slippage_net_pnl") or 0) <= 0:
+        issues.append("model replay is not profitable at double slippage")
+    for code in indices:
+        if code not in (summary.get("per_index") or {}):
+            issues.append(f"{code}: no executed option trades in replay")
+        elif float(summary["per_index"][code]) <= 0:
+            issues.append(f"{code}: replay net P&L is not positive")
+    if int(baseline.get("trades") or 0) == 0:
+        issues.append("rule-only comparison has no executed option trades")
+    elif summary.get("profit_factor") is not None and baseline.get("profit_factor") is not None and float(summary["profit_factor"]) <= float(baseline["profit_factor"]):
+        issues.append("model replay profit factor does not exceed rule-only")
+    return issues
 
 
 def _new_funnel() -> dict:
@@ -185,9 +209,20 @@ def run_backtest_job(db_url: str, run_id: int, model_path: str) -> None:
             minimum_option_volume = max(0, int(config.get("minimum_option_volume", 1)))
             maximum_spread_pct = Decimal(str(config.get("maximum_spread_pct", "1.5")))
             model = RegimeModel(Path(model_path)) if strategy_mode == "MODEL" else None
+            setup_model = (
+                SetupQualityModel(Path(str(config.get("setup_model_path"))))
+                if strategy_mode == "SETUP_QUALITY" and config.get("setup_model_path")
+                else None
+            )
             if strategy_mode == "MODEL" and (model is None or not model.available):
                 raise RuntimeError("Model unavailable. Download verified index candles and train the XGBoost model first.")
-            training_end = model.metadata.get("training_end") if model else None
+            if strategy_mode == "SETUP_QUALITY" and (setup_model is None or not setup_model.available):
+                raise RuntimeError("Setup-quality research model is unavailable")
+            training_end = (
+                setup_model.metadata.get("validation_end")
+                if setup_model
+                else model.metadata.get("training_end") if model else None
+            )
             if training_end and run.start_date <= date.fromisoformat(training_end):
                 raise RuntimeError(
                     f"Backtest must start after the model training period ({training_end}) to prevent in-sample results"
@@ -204,51 +239,135 @@ def run_backtest_job(db_url: str, run_id: int, model_path: str) -> None:
             rule_only_baseline = {code: 0 for code in config["indices"]}
             for code_index, code in enumerate(config["indices"]):
                 funnel = funnels[code]
-                candles = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == code, Candle.data_role == "SPOT", Candle.timeframe == "5minute", Candle.timestamp >= datetime.combine(run.start_date, time.min, tzinfo=UTC), Candle.timestamp <= datetime.combine(run.end_date, time.max, tzinfo=UTC), Candle.source_verified.is_(True)).order_by(Candle.timestamp)).all()
+                history_start = run.start_date - timedelta(days=5) if strategy_mode == "SETUP_QUALITY" else run.start_date
+                candles = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == code, Candle.data_role == "SPOT", Candle.timeframe == "5minute", Candle.timestamp >= datetime.combine(history_start, time.min, tzinfo=UTC), Candle.timestamp <= datetime.combine(run.end_date, time.max, tzinfo=UTC), Candle.source_verified.is_(True)).order_by(Candle.timestamp)).all()
                 if len(candles) < 60:
                     warnings.add(f"{code}: fewer than 60 verified candles")
                     funnel["rejections"]["INSUFFICIENT_SPOT_HISTORY"] += 1
                     continue
-                future_candles = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == code, Candle.data_role == "FUTURE", Candle.timeframe == "5minute", Candle.timestamp >= datetime.combine(run.start_date, time.min, tzinfo=UTC), Candle.timestamp <= datetime.combine(run.end_date, time.max, tzinfo=UTC), Candle.source_verified.is_(True)).order_by(Candle.timestamp)).all()
+                future_candles = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == code, Candle.data_role == "FUTURE", Candle.timeframe == "5minute", Candle.timestamp >= datetime.combine(history_start, time.min, tzinfo=UTC), Candle.timestamp <= datetime.combine(run.end_date, time.max, tzinfo=UTC), Candle.source_verified.is_(True)).order_by(Candle.timestamp)).all()
                 future_instruments = session.scalars(select(Instrument).where(Instrument.provider == provider, Instrument.underlying_code == code, Instrument.instrument_kind == "FUTURE")).all()
-                futures_frame = front_future_frame(future_candles, future_instruments)
+                futures_frame = front_future_frame(
+                    future_candles,
+                    future_instruments,
+                    include_expiry=strategy_mode == "SETUP_QUALITY",
+                )
                 if len(futures_frame) < 60:
                     warnings.add(f"{code}: fewer than 60 aligned futures candles")
                     funnel["rejections"]["INSUFFICIENT_FUTURES_HISTORY"] += 1
                     continue
-                frame = with_futures_features(
-                    pd.DataFrame([{"timestamp": item.timestamp, "open": float(item.open), "high": float(item.high), "low": float(item.low), "close": float(item.close), "volume": item.volume} for item in candles]),
-                    futures_frame,
+                spot_frame = pd.DataFrame(
+                    [
+                        {
+                            "timestamp": item.timestamp,
+                            "open": float(item.open),
+                            "high": float(item.high),
+                            "low": float(item.low),
+                            "close": float(item.close),
+                            "volume": item.volume,
+                            "india_vix": item.india_vix,
+                        }
+                        for item in candles
+                    ]
                 )
-                for index in range(50, len(frame)):
-                    row = frame.iloc[index]
-                    stamp = pd.Timestamp(row.timestamp).to_pydatetime().astimezone(UTC)
-                    source = candles[index]
-                    decision = (
-                        decide(row, {"india_vix": source.india_vix, "futures_basis_pct": source.futures_basis_pct, "pcr": source.pcr}, model)
-                        if strategy_mode == "MODEL"
-                        else rule_only_decide(row)
+                if strategy_mode == "SETUP_QUALITY":
+                    relative_code = relative_index_code(code)
+                    relative_rows = session.scalars(
+                        select(Candle).where(
+                            Candle.provider == provider,
+                            Candle.underlying_code == relative_code,
+                            Candle.data_role == "SPOT",
+                            Candle.timeframe == "5minute",
+                            Candle.timestamp >= datetime.combine(history_start, time.min, tzinfo=UTC),
+                            Candle.timestamp <= datetime.combine(run.end_date, time.max, tzinfo=UTC),
+                            Candle.source_verified.is_(True),
+                        ).order_by(Candle.timestamp)
+                    ).all()
+                    relative_frame = pd.DataFrame(
+                        [
+                            {
+                                "timestamp": item.timestamp,
+                                "open": float(item.open),
+                                "high": float(item.high),
+                                "low": float(item.low),
+                                "close": float(item.close),
+                                "volume": item.volume,
+                            }
+                            for item in relative_rows
+                        ]
                     )
-                    funnel["bars_evaluated"] += 1
-                    if strategy_mode == "MODEL" and rule_only_decide(row).direction != "NO_TRADE":
+                    candidate_rows = setup_rule_candidates(
+                        spot_frame,
+                        futures_frame,
+                        code,
+                        relative_frame=relative_frame,
+                    )
+                    run_start = pd.Timestamp(datetime.combine(run.start_date, time.min, tzinfo=UTC))
+                    run_end = pd.Timestamp(datetime.combine(run.end_date, time.max, tzinfo=UTC))
+                    funnel["bars_evaluated"] += int(
+                        ((pd.to_datetime(spot_frame.timestamp, utc=True) >= run_start) & (pd.to_datetime(spot_frame.timestamp, utc=True) <= run_end)).sum()
+                    )
+                    for candidate in candidate_rows.to_dict("records"):
+                        stamp = pd.Timestamp(candidate["timestamp"])
+                        stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+                        if stamp < run_start or stamp > run_end:
+                            continue
                         rule_only_baseline[code] += 1
-                    if strategy_mode == "MODEL":
-                        if decision.regime not in {"UPTREND", "DOWNTREND"}:
+                        funnel["directional_predictions"] += 1
+                        model_decision, probability = setup_model.predict(
+                            code, {name: float(candidate[name]) for name in SETUP_FEATURES}
+                        )
+                        if model_decision != "TAKE":
+                            funnel["rejections"]["MODEL_SKIP"] += 1
+                            continue
+                        funnel["confidence_passed"] += 1
+                        funnel["confirmed_signals"] += 1
+                        decision = Decision(
+                            "SETUP_QUALITY",
+                            probability,
+                            str(candidate["direction"]),
+                            "Rule candidate accepted by TAKE/SKIP model",
+                            {name: float(candidate[name]) for name in SETUP_FEATURES},
+                        )
+                        row = pd.Series(
+                            {
+                                **candidate,
+                                "close": float(candidate["signal_close"]),
+                                "atr": float(candidate["signal_atr"]),
+                            }
+                        )
+                        events.append({"time": stamp.to_pydatetime(), "code": code, "decision": decision, "row": row})
+                else:
+                    frame = with_futures_features(spot_frame, futures_frame)
+                    for index in range(50, len(frame)):
+                        row = frame.iloc[index]
+                        stamp = pd.Timestamp(row.timestamp).to_pydatetime().astimezone(UTC)
+                        source = candles[index]
+                        decision = (
+                            decide(row, {"india_vix": source.india_vix, "futures_basis_pct": source.futures_basis_pct, "pcr": source.pcr}, model)
+                            if strategy_mode == "MODEL"
+                            else rule_only_decide(row)
+                        )
+                        funnel["bars_evaluated"] += 1
+                        if strategy_mode == "MODEL" and rule_only_decide(row).direction != "NO_TRADE":
+                            rule_only_baseline[code] += 1
+                        if strategy_mode == "MODEL":
+                            if decision.regime not in {"UPTREND", "DOWNTREND"}:
+                                funnel["rejections"][_strategy_rejection_reason(row, decision, strategy_mode)] += 1
+                                continue
+                            funnel["directional_predictions"] += 1
+                            if decision.confidence < 0.70:
+                                funnel["rejections"]["CONFIDENCE_BELOW_70"] += 1
+                                continue
+                            funnel["confidence_passed"] += 1
+                        if decision.direction == "NO_TRADE":
                             funnel["rejections"][_strategy_rejection_reason(row, decision, strategy_mode)] += 1
                             continue
-                        funnel["directional_predictions"] += 1
-                        if decision.confidence < 0.70:
-                            funnel["rejections"]["CONFIDENCE_BELOW_70"] += 1
-                            continue
-                        funnel["confidence_passed"] += 1
-                    if decision.direction == "NO_TRADE":
-                        funnel["rejections"][_strategy_rejection_reason(row, decision, strategy_mode)] += 1
-                        continue
-                    if strategy_mode == "RULE_ONLY":
-                        funnel["directional_predictions"] += 1
-                        funnel["confidence_passed"] += 1
-                    funnel["confirmed_signals"] += 1
-                    events.append({"time": stamp, "code": code, "decision": decision, "row": row})
+                        if strategy_mode == "RULE_ONLY":
+                            funnel["directional_predictions"] += 1
+                            funnel["confidence_passed"] += 1
+                        funnel["confirmed_signals"] += 1
+                        events.append({"time": stamp, "code": code, "decision": decision, "row": row})
                 run.progress_percent = 5 + int((code_index + 1) / len(config["indices"]) * 30)
                 session.commit()
             events.sort(key=lambda item: (-item["decision"].confidence, item["code"]))

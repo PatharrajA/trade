@@ -55,6 +55,21 @@ async def test_paper_requires_analytics_but_not_trading_token(session):
 
 
 @pytest.mark.asyncio
+async def test_paper_requires_approved_setup_model_when_explicitly_unavailable(session):
+    ok, message = await change_mode(
+        session,
+        FakeUpstox(),
+        FakeUpstox(),
+        "PAPER",
+        model_available=False,
+    )
+
+    assert not ok
+    assert "TAKE/SKIP" in message
+    assert session.get(RuntimeSetting, 1).execution_mode == "STOPPED"
+
+
+@pytest.mark.asyncio
 async def test_live_safety_gate_blocks_unready_model_and_paper_soak(session):
     ok, message = await change_mode(
         session,

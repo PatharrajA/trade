@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 from .database import database_health, settings_dict
 from .config import config
 from .data_quality import research_readiness
-from .models import BacktestRun, Candle, Instrument, ModelArtifact, NotificationOutbox, Order, ResearchSyncRun, RuntimeSetting, Signal, SystemEvent, Trade
-from .strategy import FEATURE_SCHEMA
+from .models import BacktestRun, Candle, Instrument, ModelArtifact, NotificationOutbox, Order, ResearchSyncRun, RuntimeSetting, ShadowObservation, Signal, SystemEvent, Trade
+from .strategy import SUPPORTED_FEATURE_SCHEMAS
+from .shadow_quality import shadow_report
 from .training import load_model_metadata
 
 
@@ -242,13 +243,29 @@ def backtests_context(session: Session, selected_id: int | None = None) -> dict:
             model_details[artifact.id] = json.loads(artifact.metadata_json)
         except (TypeError, ValueError):
             model_details[artifact.id] = {}
+    shadow_settings = settings_dict(session)
+    shadow_path = shadow_settings.get("setup_shadow_model_path", "") or shadow_settings.get("setup_execution_model_path", "")
+    shadow_artifact = session.scalar(
+        select(ModelArtifact).where(ModelArtifact.model_path == shadow_path).limit(1)
+    ) if shadow_path else None
+    try:
+        shadow_metadata = json.loads(shadow_artifact.metadata_json) if shadow_artifact else {}
+    except (TypeError, ValueError):
+        shadow_metadata = {}
+    shadow_rows = session.scalars(
+        select(ShadowObservation).where(
+            ShadowObservation.provider == shadow_settings.get("active_broker", "UPSTOX"),
+            ShadowObservation.model_version == shadow_metadata.get("version", ""),
+        ).order_by(ShadowObservation.signal_time.desc())
+    ).all() if shadow_metadata else []
+    shadow_results = shadow_report(shadow_rows, shadow_metadata.get("indices") or [])
     return {
         "runs": runs,
         "selected": selected,
         "summary": summary,
         "comparison": comparison,
         "warnings": warnings,
-        "model_ready": bool(model_metadata) and model_metadata.get("feature_schema") == FEATURE_SCHEMA,
+        "model_ready": bool(model_metadata) and model_metadata.get("feature_schema") in SUPPORTED_FEATURE_SCHEMAS,
         "model_metadata": model_metadata,
         "run_details": run_details,
         "verified_underlying": verified_underlying,
@@ -258,6 +275,22 @@ def backtests_context(session: Session, selected_id: int | None = None) -> dict:
         "data_readiness": research_readiness(session),
         "research_runs": research_runs,
         "model_artifacts": model_artifacts,
+        "setup_model_artifacts": [
+            artifact
+            for artifact in model_artifacts
+            if model_details.get(artifact.id, {}).get("model_type") == "SETUP_QUALITY"
+            and artifact.status != "PRUNED"
+        ],
+        "shadow_enabled": shadow_settings.get("setup_shadow_enabled") == "true",
+        "shadow_model_path": shadow_settings.get("setup_shadow_model_path", ""),
+        "setup_execution_enabled": shadow_settings.get("setup_execution_enabled") == "true",
+        "setup_execution_model_path": shadow_settings.get("setup_execution_model_path", ""),
+        "shadow_observations": shadow_rows[:20],
+        "shadow_take": shadow_results["take"],
+        "shadow_skip": shadow_results["skip"],
+        "shadow_by_index": shadow_results["by_index"],
+        "shadow_dimensions": shadow_results["dimensions"],
+        "shadow_model_version": shadow_metadata.get("version"),
         "model_details": model_details,
         "active_broker": settings_dict(session).get("active_broker", "UPSTOX"),
         "default_historical_provider": settings_dict(session).get("default_historical_provider", "UPSTOX"),

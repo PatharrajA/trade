@@ -1,5 +1,5 @@
 {% set comparison_running = comparison and comparison.run.status in ['QUEUED','RUNNING'] %}
-<section id="backtest-result" class="card result-card" {% if selected.status in ['QUEUED','RUNNING'] or comparison_running %}hx-get="/backtests/{{ selected.id }}/status" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+<section id="backtest-result" class="card result-card" {% if selected.status in ['QUEUED','RUNNING'] or comparison_running %}data-poll-url="/backtests/{{ selected.id }}/status"{% endif %}>
   {% set selected_mode = run_details.get(selected.id, {}).get('strategy_mode', 'MODEL') %}
   <div class="card-head">
     <h2>Backtest #{{ selected.id }} · {{ selected_mode|replace('_',' ') }}</h2>

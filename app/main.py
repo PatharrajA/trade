@@ -7,28 +7,31 @@ import json
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from pathlib import Path
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .backtest import BacktestService, trades_csv
+from .backtest import BacktestService, setup_replay_quality_issues, trades_csv
 from .config import config
 from .dashboard import backtests_context, dashboard_context, orders_context, system_context, telegram_context
 from .database import SessionLocal, database_health, get_session, init_db, settings_dict
 from .groww import GrowwClient
 from .model_registry import activate_candidate, register_candidate
 from .mode_control import change_mode, reconcile
-from .models import BacktestRun, BacktestTrade, Candle, Instrument, Order, ResearchSyncRun, RuntimeSetting, Setting, SystemEvent, Trade
+from .models import BacktestRun, BacktestTrade, Candle, Instrument, ModelArtifact, Order, ResearchSyncRun, RuntimeSetting, Setting, ShadowObservation, SystemEvent, Trade
 from .providers import provider_name
 from .operations import backup_status, file_permission_status
 from .research_jobs import ResearchJobService
 from .runtime import RuntimeService
+from .setup_quality import SETUP_INDICES, SetupQualityModel, inspect_setup_training_data, train_setup_quality_models
+from .shadow_quality import shadow_report
 from .telegram import TelegramWorker, enqueue
 from .training import load_model_metadata, train_regime_model
 from .upstox import UpstoxClient
@@ -116,6 +119,19 @@ app = FastAPI(title="NiftyPilot", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(config.root / "static")), name="static")
 
 
+@app.websocket("/ws")
+async def status_socket(websocket: WebSocket) -> None:
+    """Keep local status clients connected without exposing trading controls."""
+    await websocket.accept()
+    await websocket.send_json({"type": "connected"})
+    try:
+        while True:
+            if await websocket.receive_text() == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        pass
+
+
 def page(request: Request, name: str, context: dict, *, status_code: int = 200):
     return templates.TemplateResponse(name=name, request=request, context={"active": name.split(".")[0], **context}, status_code=status_code)
 
@@ -146,6 +162,12 @@ async def set_mode(target: str = Form(...), confirmation: str = Form(""), sessio
     _, market_broker, trading_broker = selected_brokers(session)
     app_settings = settings_dict(session)
     active_provider = provider_name(app_settings.get("active_broker"))
+    setup_execution_model = SetupQualityModel(
+        Path(app_settings.get("setup_execution_model_path") or "/nonexistent")
+    )
+    setup_execution_available = (
+        app_settings.get("setup_execution_enabled") == "true" and setup_execution_model.available
+    )
     paper_sessions = session.scalar(
         select(func.count(func.distinct(func.date(Trade.exit_time)))).where(
             Trade.mode == "PAPER", Trade.status == "CLOSED"
@@ -170,7 +192,7 @@ async def set_mode(target: str = Form(...), confirmation: str = Form(""), sessio
         trading_broker,
         target,
         confirmation,
-        model_available=runtime_service.model.available,
+        model_available=setup_execution_available,
         paper_sessions=int(paper_sessions),
         required_paper_sessions=int(app_settings.get("required_paper_sessions", "20")),
         enforce_paper_sessions=app_settings.get("enforce_paper_session_requirement", "true") == "true",
@@ -241,11 +263,12 @@ def start_backtest(
     slippage_pct: Decimal = Form(Decimal("0.05")),
     historical_provider: str = Form("UPSTOX"),
     cost_model: str = Form("UPSTOX"),
-    strategy_mode: str = Form("MODEL"),
+    strategy_mode: str = Form("SETUP_QUALITY"),
     strike_policy: str = Form("ATM_ITM1"),
     entry_delay_bars: int = Form(1),
     minimum_option_volume: int = Form(1),
     maximum_spread_pct: Decimal = Form(Decimal("1.5")),
+    setup_model_id: int | None = Form(None),
     compare_rule_only: bool = Form(False),
     session: Session = Depends(get_session),
 ):
@@ -256,21 +279,45 @@ def start_backtest(
         cost_model = "GROWW"
     elif cost_model not in {"UPSTOX", "UPSTOX_PLUS"}:
         cost_model = "UPSTOX"
-    if historical_provider not in {"UPSTOX", "GROWW"} or cost_model not in {"UPSTOX", "GROWW", "UPSTOX_PLUS"} or strategy_mode not in {"MODEL", "RULE_ONLY"} or strike_policy not in {"ATM_ONLY", "ATM_ITM1"}:
+    if historical_provider not in {"UPSTOX", "GROWW"} or cost_model not in {"UPSTOX", "GROWW", "UPSTOX_PLUS"} or strategy_mode not in {"MODEL", "SETUP_QUALITY", "RULE_ONLY"} or strike_policy not in {"ATM_ONLY", "ATM_ITM1"}:
         return flash_redirect("/backtests", "Unknown data provider or cost model", False)
     if not selected or start_date > end_date or capital <= 0 or not (Decimal("0") < risk_pct <= Decimal("2")) or slippage_pct < 0 or entry_delay_bars < 1 or minimum_option_volume < 0 or maximum_spread_pct <= 0:
         return flash_redirect("/backtests", "Please check the backtest inputs", False)
     model_metadata = load_model_metadata(config.model_path)
     if strategy_mode == "MODEL" and not model_metadata:
         return flash_redirect("/backtests", "Train and activate a model before running a model backtest", False)
-    training_end = model_metadata.get("training_end")
-    if strategy_mode == "MODEL" and training_end and start_date <= date.fromisoformat(training_end):
+    selected_model_metadata = model_metadata
+    setup_model_path = None
+    if strategy_mode == "SETUP_QUALITY":
+        artifact = session.get(ModelArtifact, setup_model_id) if setup_model_id else None
+        if artifact is None:
+            return flash_redirect("/backtests", "Select a setup-quality research model", False)
+        try:
+            selected_model_metadata = json.loads(artifact.metadata_json)
+        except (TypeError, ValueError):
+            selected_model_metadata = {}
+        if selected_model_metadata.get("model_type") != "SETUP_QUALITY" or not Path(artifact.model_path).exists():
+            return flash_redirect("/backtests", "The selected setup-quality model is unavailable", False)
+        unsupported_indices = set(selected) - set(selected_model_metadata.get("indices") or [])
+        if unsupported_indices:
+            return flash_redirect(
+                "/backtests",
+                "The selected setup-quality model does not contain: " + ", ".join(sorted(unsupported_indices)),
+                False,
+            )
+        setup_model_path = artifact.model_path
+    training_end = (
+        selected_model_metadata.get("validation_end")
+        if strategy_mode == "SETUP_QUALITY"
+        else selected_model_metadata.get("training_end")
+    )
+    if strategy_mode in {"MODEL", "SETUP_QUALITY"} and training_end and start_date <= date.fromisoformat(training_end):
         return flash_redirect(
             "/backtests",
             f"Model testing must start after its training period ({training_end})",
             False,
         )
-    run_config = {"indices": selected, "capital": str(capital), "risk_pct": str(risk_pct), "slippage_pct": str(slippage_pct), "historical_provider": historical_provider, "cost_model": cost_model, "strategy_mode": strategy_mode, "strike_policy": strike_policy, "entry_delay_bars": entry_delay_bars, "minimum_option_volume": minimum_option_volume, "maximum_spread_pct": str(maximum_spread_pct), "model_version": model_metadata.get("version"), "feature_schema": model_metadata.get("feature_schema"), "compare_rule_only": compare_rule_only}
+    run_config = {"indices": selected, "capital": str(capital), "risk_pct": str(risk_pct), "slippage_pct": str(slippage_pct), "historical_provider": historical_provider, "cost_model": cost_model, "strategy_mode": strategy_mode, "strike_policy": strike_policy, "entry_delay_bars": entry_delay_bars, "minimum_option_volume": minimum_option_volume, "maximum_spread_pct": str(maximum_spread_pct), "model_version": selected_model_metadata.get("version"), "feature_schema": selected_model_metadata.get("feature_schema"), "setup_model_path": setup_model_path, "compare_rule_only": compare_rule_only}
     run = BacktestRun(
         configuration_json=json.dumps(run_config),
         start_date=start_date,
@@ -279,7 +326,7 @@ def start_backtest(
     session.add(run)
     session.flush()
     comparison_run = None
-    if compare_rule_only and strategy_mode == "MODEL":
+    if compare_rule_only and strategy_mode in {"MODEL", "SETUP_QUALITY"}:
         comparison_config = {**run_config, "strategy_mode": "RULE_ONLY", "compare_rule_only": False, "comparison_parent_id": run.id}
         comparison_run = BacktestRun(
             configuration_json=json.dumps(comparison_config),
@@ -444,14 +491,110 @@ async def train_model(
             historical_provider,
         )
         artifact = register_candidate(session, candidate_path, metadata)
+        quality = metadata.get("activation_quality") or {}
+        quality_message = (
+            "Activation quality gate passed."
+            if quality.get("ready")
+            else "Activation blocked: " + "; ".join(quality.get("issues") or ["validation quality is insufficient"])
+        )
         return flash_redirect(
             "/backtests",
-            f"Candidate #{artifact.id} trained on {metadata['samples']} samples; review validation results and activate it explicitly.",
+            f"Candidate #{artifact.id} trained on {metadata['samples']} samples. {quality_message}",
         )
     except ModuleNotFoundError:
         return flash_redirect("/backtests", "XGBoost is not installed. Run: pip install -r requirements.txt", False)
     except Exception as exc:
         return flash_redirect("/backtests", f"Model training failed: {exc}", False)
+
+
+@app.post("/backtests/check-setup-data", response_class=HTMLResponse)
+async def check_setup_training_data(
+    request: Request,
+    indices: list[str] = Form(...),
+    fit_start: date = Form(...),
+    fit_end: date = Form(...),
+    tuning_end: date = Form(...),
+    holdout_end: date = Form(...),
+    session: Session = Depends(get_session),
+):
+    selected = list(dict.fromkeys(item for item in indices if item in SETUP_INDICES))
+    if not selected or not fit_start <= fit_end < tuning_end < holdout_end or holdout_end > date.today():
+        return flash_redirect("/backtests", "Please check the training indices and dates", False)
+    provider = provider_name(settings_dict(session).get("active_broker"))
+    try:
+        readiness = await asyncio.to_thread(
+            inspect_setup_training_data, config.database_url,
+            selected, fit_start, fit_end, tuning_end, holdout_end, provider,
+        )
+    except Exception as exc:
+        return flash_redirect("/backtests", f"Training data check failed: {exc}", False)
+    return page(request, "backtests.html", {
+        **backtests_context(session), "training_readiness": readiness,
+        "selected_training_indices": selected,
+        "training_dates": {
+            "fit_start": fit_start.isoformat(), "fit_end": fit_end.isoformat(),
+            "tuning_end": tuning_end.isoformat(), "holdout_end": holdout_end.isoformat(),
+        },
+    })
+
+
+@app.post("/backtests/train-setup-quality")
+async def train_setup_quality_model(
+    indices: list[str] = Form(...),
+    fit_start: date = Form(...),
+    fit_end: date = Form(...),
+    tuning_end: date = Form(...),
+    holdout_end: date = Form(...),
+    historical_provider: str = Form("UPSTOX"),
+    session: Session = Depends(get_session),
+):
+    selected = [item for item in indices if item in SETUP_INDICES]
+    historical_provider = provider_name(settings_dict(session).get("active_broker"))
+    if (
+        historical_provider not in {"UPSTOX", "GROWW"}
+        or not selected
+        or not fit_start <= fit_end < tuning_end < holdout_end
+        or holdout_end > date.today()
+    ):
+        return flash_redirect("/backtests", "Please check the setup-quality training periods", False)
+    try:
+        candidate_path = (
+            config.model_path.parent
+            / "candidates"
+            / f"setup-candidate-{datetime.now().strftime('%Y%m%dT%H%M%S%f')}.json"
+        )
+        metadata = await asyncio.to_thread(
+            train_setup_quality_models,
+            config.database_url,
+            candidate_path,
+            selected,
+            fit_start,
+            fit_end,
+            tuning_end,
+            holdout_end,
+            historical_provider,
+        )
+        artifact = register_candidate(session, candidate_path, metadata)
+        research_quality = metadata.get("research_quality") or {}
+        activation_quality = metadata.get("activation_quality") or {}
+        if activation_quality.get("ready"):
+            message = "Historical quality gate passed. Continue with option backtesting and shadow validation."
+        elif research_quality.get("ready_for_option_replay"):
+            message = "Research gate passed, but activation remains blocked: " + "; ".join(
+                activation_quality.get("issues") or ["verified option-price labels are required"]
+            )
+        else:
+            message = "Research gate did not pass: " + "; ".join(
+                research_quality.get("issues") or ["validation quality is insufficient"]
+            )
+        return flash_redirect(
+            "/backtests",
+            f"Setup-quality candidate #{artifact.id} trained on {metadata['samples']} rule setups. {message}",
+        )
+    except ModuleNotFoundError:
+        return flash_redirect("/backtests", "XGBoost is not installed. Run: pip install -r requirements.txt", False)
+    except Exception as exc:
+        return flash_redirect("/backtests", f"Setup-quality training failed: {exc}", False)
 
 
 @app.post("/backtests/models/{artifact_id}/activate")
@@ -467,6 +610,160 @@ def activate_model(artifact_id: int, session: Session = Depends(get_session)):
     except Exception as exc:
         return flash_redirect("/backtests", f"Model activation failed: {exc}", False)
     return flash_redirect("/backtests", f"Model {artifact.version} is now active")
+
+
+@app.post("/backtests/models/{artifact_id}/shadow")
+def enable_shadow_model(artifact_id: int, session: Session = Depends(get_session)):
+    artifact = session.get(ModelArtifact, artifact_id)
+    if artifact is None:
+        return flash_redirect("/backtests", "Setup-quality model was not found", False)
+    try:
+        metadata = json.loads(artifact.metadata_json)
+    except (TypeError, ValueError):
+        metadata = {}
+    path = Path(artifact.model_path)
+    model = SetupQualityModel(path)
+    if metadata.get("model_type") != "SETUP_QUALITY" or not model.available:
+        return flash_redirect("/backtests", "Setup-quality model bundle cannot be loaded", False)
+    for key, value in (
+        ("setup_shadow_model_path", str(path)),
+        ("setup_shadow_enabled", "true"),
+    ):
+        setting = session.get(Setting, key)
+        if setting is None:
+            session.add(Setting(key=key, value=value))
+        else:
+            setting.value = value
+    for existing in session.scalars(select(ModelArtifact).where(ModelArtifact.status == "SHADOW")):
+        existing.status = "CANDIDATE"
+    artifact.status = "SHADOW"
+    session.commit()
+    runtime_service.reload_shadow_model(str(path))
+    return flash_redirect(
+        "/backtests", f"Shadow observation enabled for {metadata.get('version', artifact.version)}; no orders will be placed"
+    )
+
+
+@app.post("/backtests/shadow/disable")
+def disable_shadow_model(session: Session = Depends(get_session)):
+    path_setting = session.get(Setting, "setup_shadow_model_path")
+    if path_setting and path_setting.value:
+        artifact = session.scalar(
+            select(ModelArtifact).where(ModelArtifact.model_path == path_setting.value).limit(1)
+        )
+        if artifact and artifact.status == "SHADOW":
+            artifact.status = "CANDIDATE"
+    setting = session.get(Setting, "setup_shadow_enabled")
+    if setting is None:
+        session.add(Setting(key="setup_shadow_enabled", value="false"))
+    else:
+        setting.value = "false"
+    session.commit()
+    runtime_service.reload_shadow_model("")
+    return flash_redirect("/backtests", "Shadow observation disabled")
+
+
+@app.post("/backtests/models/{artifact_id}/activate-setup")
+def activate_setup_model(artifact_id: int, session: Session = Depends(get_session)):
+    runtime = session.get(RuntimeSetting, 1)
+    if runtime and runtime.execution_mode != "STOPPED":
+        return flash_redirect("/backtests", "Stop execution before activating a setup-quality model", False)
+    artifact = session.get(ModelArtifact, artifact_id)
+    if artifact is None:
+        return flash_redirect("/backtests", "Setup-quality model was not found", False)
+    try:
+        metadata = json.loads(artifact.metadata_json)
+    except (TypeError, ValueError):
+        metadata = {}
+    quality = metadata.get("activation_quality") or {}
+    path = Path(artifact.model_path)
+    if metadata.get("model_type") != "SETUP_QUALITY" or not SetupQualityModel(path).available:
+        return flash_redirect("/backtests", "Setup-quality model bundle cannot be loaded", False)
+    if not quality.get("ready"):
+        return flash_redirect(
+            "/backtests",
+            "Setup-quality activation blocked: " + "; ".join(quality.get("issues") or ["quality gate failed"]),
+            False,
+        )
+    replay_issues = ["Complete a post-holdout option backtest with rule-only comparison"]
+    for run in session.scalars(
+        select(BacktestRun).where(BacktestRun.status == "COMPLETE").order_by(BacktestRun.id.desc())
+    ):
+        try:
+            run_config = json.loads(run.configuration_json)
+            run_summary = json.loads(run.summary_json) if run.summary_json else {}
+        except (TypeError, ValueError):
+            continue
+        if (
+            run_config.get("strategy_mode") != "SETUP_QUALITY"
+            or run_config.get("model_version") != metadata.get("version")
+            or run_config.get("historical_provider") != provider_name(settings_dict(session).get("active_broker"))
+            or set(run_config.get("indices") or []) != set(metadata.get("indices") or [])
+            or run.start_date <= date.fromisoformat(metadata["validation_end"])
+        ):
+            continue
+        comparison = session.get(BacktestRun, run_config.get("comparison_run_id")) if run_config.get("comparison_run_id") else None
+        if not comparison or comparison.status != "COMPLETE":
+            continue
+        try:
+            comparison_config = json.loads(comparison.configuration_json)
+            comparison_summary = json.loads(comparison.summary_json) if comparison.summary_json else {}
+        except (TypeError, ValueError):
+            continue
+        if comparison_config.get("comparison_parent_id") != run.id or comparison_config.get("strategy_mode") != "RULE_ONLY":
+            continue
+        replay_issues = setup_replay_quality_issues(run_summary, comparison_summary, metadata["indices"])
+        if not replay_issues:
+            break
+    if replay_issues:
+        return flash_redirect("/backtests", "Setup-quality replay gate blocked activation: " + "; ".join(replay_issues), False)
+    shadow_rows = session.scalars(
+        select(ShadowObservation).where(
+            ShadowObservation.model_version == metadata.get("version"),
+            ShadowObservation.provider == provider_name(settings_dict(session).get("active_broker")),
+        )
+    ).all()
+    shadow_issues = shadow_report(shadow_rows, metadata.get("indices") or []).get("issues", [])
+    if shadow_issues:
+        return flash_redirect(
+            "/backtests", "Setup-quality shadow gate blocked activation: " + "; ".join(shadow_issues), False
+        )
+    for key, value in (
+        ("setup_execution_model_path", str(path)),
+        ("setup_execution_enabled", "true"),
+    ):
+        setting = session.get(Setting, key)
+        if setting is None:
+            session.add(Setting(key=key, value=value))
+        else:
+            setting.value = value
+    for existing in session.scalars(select(ModelArtifact).where(ModelArtifact.status == "ACTIVE_SETUP")):
+        existing.status = "ARCHIVED"
+    artifact.status = "ACTIVE_SETUP"
+    artifact.activated_at = datetime.now(UTC)
+    session.commit()
+    return flash_redirect("/backtests", f"Setup-quality model {artifact.version} is enabled for Paper/Live")
+
+
+@app.post("/backtests/setup-execution/disable")
+def disable_setup_execution(session: Session = Depends(get_session)):
+    runtime = session.get(RuntimeSetting, 1)
+    if runtime and runtime.execution_mode != "STOPPED":
+        return flash_redirect("/backtests", "Stop execution before changing the active strategy model", False)
+    path_setting = session.get(Setting, "setup_execution_model_path")
+    if path_setting and path_setting.value:
+        artifact = session.scalar(
+            select(ModelArtifact).where(ModelArtifact.model_path == path_setting.value).limit(1)
+        )
+        if artifact and artifact.status == "ACTIVE_SETUP":
+            artifact.status = "ARCHIVED"
+    setting = session.get(Setting, "setup_execution_enabled")
+    if setting is None:
+        session.add(Setting(key="setup_execution_enabled", value="false"))
+    else:
+        setting.value = "false"
+    session.commit()
+    return flash_redirect("/backtests", "Setup-quality Paper/Live execution disabled")
 
 
 @app.get("/backtests/{run_id}/status", response_class=HTMLResponse)

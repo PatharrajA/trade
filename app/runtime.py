@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -15,10 +16,12 @@ from .database import settings_dict
 from .domain import Contract
 from .execution import ExecutionService
 from .mode_control import reconcile
-from .models import Candle, Instrument, RuntimeSetting, Signal, SystemEvent, Trade
+from .models import Candle, Instrument, RuntimeSetting, ShadowObservation, Signal, SystemEvent, Trade
 from .option_selector import select_option
 from .providers import BrokerClient, provider_name
-from .strategy import RegimeModel, decide, with_futures_features
+from .risk import option_charges
+from .setup_quality import SETUP_FEATURES, SetupQualityModel, relative_index_code, setup_rule_candidates
+from .strategy import Decision, RegimeModel, decide, with_futures_features
 from .telegram import enqueue
 from .training import front_future_frame
 
@@ -33,6 +36,10 @@ class RuntimeService:
         self.session_factory = session_factory
         self.execution = ExecutionService(trading_brokers)
         self.model = RegimeModel(config.model_path)
+        self.shadow_model = SetupQualityModel(Path("/nonexistent"))
+        self.shadow_model_path = ""
+        self.setup_model = SetupQualityModel(Path("/nonexistent"))
+        self.setup_model_path = ""
         self.stop_event = asyncio.Event()
         self.last_tick: datetime | None = None
         self.last_candle: datetime | None = None
@@ -40,6 +47,7 @@ class RuntimeService:
         self.last_error: str | None = None
         self.last_report_day: date | None = None
         self.last_reconcile_at: datetime | None = None
+        self.last_shadow_monitor_at: datetime | None = None
         self.invalid_candle_alerts: set[tuple[str, str, date]] = set()
 
     def _active_provider(self, session) -> str:
@@ -48,6 +56,23 @@ class RuntimeService:
     def reload_model(self) -> None:
         """Load a newly-trained model without restarting the application."""
         self.model = RegimeModel(config.model_path)
+
+    def reload_shadow_model(self, path: str = "") -> None:
+        self.shadow_model_path = path
+        self.shadow_model = SetupQualityModel(Path(path)) if path else SetupQualityModel(Path("/nonexistent"))
+
+    def _ensure_shadow_model(self, settings: dict[str, str]) -> bool:
+        path = settings.get("setup_shadow_model_path", "")
+        if path != self.shadow_model_path:
+            self.reload_shadow_model(path)
+        return settings.get("setup_shadow_enabled") == "true" and self.shadow_model.available
+
+    def _ensure_setup_execution_model(self, settings: dict[str, str]) -> bool:
+        path = settings.get("setup_execution_model_path", "")
+        if path != self.setup_model_path:
+            self.setup_model_path = path
+            self.setup_model = SetupQualityModel(Path(path)) if path else SetupQualityModel(Path("/nonexistent"))
+        return settings.get("setup_execution_enabled") == "true" and self.setup_model.available
 
     @staticmethod
     def _record_signal_rejection(session, *, provider: str, mode: str, code: str, stamp: datetime, stage: str, reason: str, decision=None, details: dict | None = None) -> None:
@@ -281,6 +306,254 @@ class RuntimeService:
                         session.commit()
             self.last_candle = max(self.last_candle or latest[0], latest[0])
 
+    async def process_shadow_signals(self, boundary: datetime) -> None:
+        """Record TAKE and SKIP outcomes without creating an Order or Trade."""
+        with self.session_factory() as session:
+            settings = settings_dict(session)
+            if not self._ensure_shadow_model(settings):
+                return
+            provider = provider_name(settings.get("active_broker"))
+            broker = self.market_brokers[provider]
+            model_version = str(self.shadow_model.metadata.get("version") or "setup-shadow")
+            for code in self.shadow_model.models:
+                rows = session.scalars(
+                    select(Candle).where(
+                        Candle.provider == provider,
+                        Candle.underlying_code == code,
+                        Candle.data_role == "SPOT",
+                        Candle.timeframe == "5minute",
+                        Candle.timestamp < boundary,
+                    ).order_by(Candle.timestamp.desc()).limit(240)
+                ).all()[::-1]
+                if len(rows) < 80:
+                    continue
+                future_rows = session.scalars(
+                    select(Candle).where(
+                        Candle.provider == provider,
+                        Candle.underlying_code == code,
+                        Candle.data_role == "FUTURE",
+                        Candle.timeframe == "5minute",
+                        Candle.timestamp < boundary,
+                    ).order_by(Candle.timestamp.desc()).limit(480)
+                ).all()
+                future_instruments = session.scalars(
+                    select(Instrument).where(
+                        Instrument.provider == provider,
+                        Instrument.underlying_code == code,
+                        Instrument.instrument_kind == "FUTURE",
+                    )
+                ).all()
+                futures_frame = front_future_frame(
+                    future_rows, future_instruments, include_expiry=True
+                )
+                if len(futures_frame) < 80:
+                    continue
+                relative_code = relative_index_code(code)
+                relative_rows = session.scalars(
+                    select(Candle).where(
+                        Candle.provider == provider,
+                        Candle.underlying_code == relative_code,
+                        Candle.data_role == "SPOT",
+                        Candle.timeframe == "5minute",
+                        Candle.timestamp < boundary,
+                    ).order_by(Candle.timestamp.desc()).limit(240)
+                ).all()[::-1]
+                spot_frame = pd.DataFrame(
+                    [
+                        {
+                            "timestamp": item.timestamp,
+                            "open": float(item.open),
+                            "high": float(item.high),
+                            "low": float(item.low),
+                            "close": float(item.close),
+                            "volume": item.volume,
+                            "india_vix": item.india_vix,
+                        }
+                        for item in rows
+                    ]
+                )
+                relative_frame = pd.DataFrame(
+                    [
+                        {
+                            "timestamp": item.timestamp,
+                            "open": float(item.open),
+                            "high": float(item.high),
+                            "low": float(item.low),
+                            "close": float(item.close),
+                            "volume": item.volume,
+                        }
+                        for item in relative_rows
+                    ]
+                )
+                candidates = setup_rule_candidates(
+                    spot_frame, futures_frame, code, relative_frame=relative_frame
+                )
+                if candidates.empty:
+                    continue
+                candidate = candidates.iloc[-1]
+                signal_time = pd.Timestamp(candidate.timestamp)
+                signal_time = signal_time.tz_localize("UTC") if signal_time.tzinfo is None else signal_time.tz_convert("UTC")
+                last_candle = pd.Timestamp(rows[-1].timestamp)
+                last_candle = last_candle.tz_localize("UTC") if last_candle.tzinfo is None else last_candle.tz_convert("UTC")
+                if signal_time != last_candle:
+                    continue
+                stored_time = signal_time.to_pydatetime().replace(tzinfo=None)
+                exists = session.scalar(
+                    select(ShadowObservation.id).where(
+                        ShadowObservation.model_version == model_version,
+                        ShadowObservation.underlying_code == code,
+                        ShadowObservation.signal_time == stored_time,
+                    ).limit(1)
+                )
+                if exists:
+                    continue
+                decision, probability = self.shadow_model.predict(
+                    code, {name: float(candidate[name]) for name in SETUP_FEATURES}
+                )
+                direction = str(candidate.direction)
+                spot = Decimal(str(candidate.signal_close))
+                atr = Decimal(str(candidate.signal_atr))
+                stop = spot - atr if direction == "CE" else spot + atr
+                target = spot + atr * Decimal("1.5") if direction == "CE" else spot - atr * Decimal("1.5")
+                observation = ShadowObservation(
+                    provider=provider,
+                    model_version=model_version,
+                    underlying_code=code,
+                    signal_time=stored_time,
+                    direction=direction,
+                    setup_type=str(candidate.setup_type),
+                    probability=probability,
+                    decision=decision,
+                    threshold=self.shadow_model.thresholds[code],
+                    underlying_entry=spot,
+                    underlying_stop=stop,
+                    underlying_target=target,
+                    timeout_at=(signal_time + pd.Timedelta(minutes=45)).to_pydatetime().replace(tzinfo=None),
+                    details_json=json.dumps(
+                        {"features": {name: float(candidate[name]) for name in SETUP_FEATURES}},
+                        sort_keys=True,
+                    ),
+                )
+                db_contracts = session.scalars(
+                    select(Instrument).where(
+                        Instrument.provider == provider,
+                        Instrument.underlying_code == code,
+                        Instrument.option_type == direction,
+                        Instrument.active.is_(True),
+                        Instrument.metadata_verified.is_(True),
+                    )
+                ).all()
+                contracts = [
+                    Contract(
+                        item.instrument_key,
+                        item.trading_symbol,
+                        item.exchange,
+                        code,
+                        item.expiry,
+                        item.strike,
+                        item.option_type,
+                        item.lot_size,
+                        item.tick_size,
+                        provider=provider,
+                    )
+                    for item in db_contracts
+                ]
+                expiries = sorted({item.expiry for item in contracts if item.expiry > date.today()})
+                chain = [item for item in contracts if expiries and item.expiry == expiries[0]]
+                strikes = sorted({item.strike for item in chain})
+                if not strikes:
+                    observation.status = "REJECTED"
+                    observation.rejection_reason = "No eligible verified option contract"
+                    session.add(observation)
+                    continue
+                atm = min(strikes, key=lambda value: abs(value - spot))
+                index = strikes.index(atm)
+                itm = strikes[max(0, index - 1)] if direction == "CE" else strikes[min(len(strikes) - 1, index + 1)]
+                short_list = [item for item in chain if item.strike in {atm, itm}]
+                quotes = await broker.quotes([item.instrument_key for item in short_list])
+                selection = select_option(
+                    short_list,
+                    quotes,
+                    spot=spot,
+                    direction=direction,
+                    trading_day=date.today(),
+                    max_spread_pct=Decimal(settings["max_spread_pct"]),
+                    max_quote_age_seconds=int(settings["max_quote_age_seconds"]),
+                    delta_min=float(settings["delta_min"]),
+                    delta_max=float(settings["delta_max"]),
+                )
+                if selection.contract is None or selection.quote is None:
+                    observation.status = "REJECTED"
+                    observation.rejection_reason = selection.reason
+                else:
+                    slippage = Decimal(settings["paper_slippage_pct"]) / 100
+                    observation.instrument_key = selection.contract.instrument_key
+                    observation.trading_symbol = selection.contract.trading_symbol
+                    observation.moneyness = selection.moneyness
+                    observation.lot_size = selection.contract.lot_size
+                    observation.option_entry = selection.quote.ask * (Decimal("1") + slippage)
+                session.add(observation)
+            session.commit()
+
+    async def monitor_shadow(self) -> None:
+        now = datetime.now(UTC)
+        if self.last_shadow_monitor_at and (now - self.last_shadow_monitor_at).total_seconds() < 5:
+            return
+        self.last_shadow_monitor_at = now
+        with self.session_factory() as session:
+            settings = settings_dict(session)
+            if not self._ensure_shadow_model(settings):
+                return
+            observations = session.scalars(
+                select(ShadowObservation).where(ShadowObservation.status == "OPEN")
+            ).all()
+            for observation in observations:
+                if not observation.instrument_key or not observation.option_entry or not observation.lot_size:
+                    observation.status = "REJECTED"
+                    observation.rejection_reason = "Shadow contract or entry quote unavailable"
+                    continue
+                provider = provider_name(observation.provider)
+                broker = self.market_brokers[provider]
+                underlying_key = broker.index_key(observation.underlying_code)
+                quotes = await broker.quotes([observation.instrument_key, underlying_key])
+                option_quote = quotes.get(observation.instrument_key)
+                underlying_quote = quotes.get(underlying_key)
+                if option_quote is None or underlying_quote is None:
+                    continue
+                reason = None
+                if observation.direction == "CE" and underlying_quote.last <= observation.underlying_stop:
+                    reason = "UNDERLYING_STOP"
+                elif observation.direction == "PE" and underlying_quote.last >= observation.underlying_stop:
+                    reason = "UNDERLYING_STOP"
+                elif observation.direction == "CE" and underlying_quote.last >= observation.underlying_target:
+                    reason = "UNDERLYING_TARGET"
+                elif observation.direction == "PE" and underlying_quote.last <= observation.underlying_target:
+                    reason = "UNDERLYING_TARGET"
+                else:
+                    timeout = observation.timeout_at.replace(tzinfo=UTC) if observation.timeout_at.tzinfo is None else observation.timeout_at.astimezone(UTC)
+                    if now >= timeout:
+                        reason = "TIMEOUT"
+                if reason is None:
+                    continue
+                slippage = Decimal(settings["paper_slippage_pct"]) / 100
+                option_exit = option_quote.bid * (Decimal("1") - slippage)
+                gross = (option_exit - observation.option_entry) * observation.lot_size
+                charges = option_charges(
+                    observation.option_entry,
+                    option_exit,
+                    observation.lot_size,
+                    provider,
+                    now.astimezone(ZoneInfo("Asia/Kolkata")).date(),
+                )
+                observation.option_exit = option_exit
+                observation.gross_pnl = gross
+                observation.charges = charges
+                observation.net_pnl = gross - charges
+                observation.exit_reason = reason
+                observation.status = "CLOSED"
+                observation.closed_at = now.replace(tzinfo=None)
+            session.commit()
+
     async def process_signals(self, boundary: datetime) -> None:
         with self.session_factory() as session:
             runtime = session.get(RuntimeSetting, 1)
@@ -289,24 +562,51 @@ class RuntimeService:
             settings = settings_dict(session)
             provider = provider_name(settings.get("active_broker"))
             broker = self.market_brokers[provider]
+            # The user-facing workflow supports only the approved setup-quality
+            # strategy. Legacy regime models remain readable for historical
+            # records, but they are no longer an execution fallback.
+            if not self._ensure_setup_execution_model(settings):
+                return
+            use_setup_model = True
             candidates = []
             for code in settings["enabled_indices"].split(","):
-                rows = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == code, Candle.data_role == "SPOT", Candle.timeframe == "5minute", Candle.timestamp < boundary).order_by(Candle.timestamp.desc()).limit(80)).all()[::-1]
+                history_limit = 240 if use_setup_model else 80
+                rows = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == code, Candle.data_role == "SPOT", Candle.timeframe == "5minute", Candle.timestamp < boundary).order_by(Candle.timestamp.desc()).limit(history_limit)).all()[::-1]
                 if len(rows) < 50:
                     self._record_signal_rejection(session, provider=provider, mode=runtime.execution_mode, code=code, stamp=boundary, stage="MARKET_DATA", reason="Insufficient spot history", details={"available_bars": len(rows), "required_bars": 50})
                     continue
-                future_rows = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == code, Candle.data_role == "FUTURE", Candle.timeframe == "5minute", Candle.timestamp < boundary).order_by(Candle.timestamp.desc()).limit(240)).all()
+                future_rows = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == code, Candle.data_role == "FUTURE", Candle.timeframe == "5minute", Candle.timestamp < boundary).order_by(Candle.timestamp.desc()).limit(480 if use_setup_model else 240)).all()
                 future_instruments = session.scalars(select(Instrument).where(Instrument.provider == provider, Instrument.underlying_code == code, Instrument.instrument_kind == "FUTURE")).all()
-                futures_frame = front_future_frame(future_rows, future_instruments)
+                futures_frame = front_future_frame(future_rows, future_instruments, include_expiry=use_setup_model)
                 if len(futures_frame) < 50:
                     self._record_signal_rejection(session, provider=provider, mode=runtime.execution_mode, code=code, stamp=boundary, stage="MARKET_DATA", reason="Insufficient aligned futures history", details={"available_bars": len(futures_frame), "required_bars": 50})
                     continue
-                frame = with_futures_features(
-                    pd.DataFrame([{"timestamp": item.timestamp, "open": float(item.open), "high": float(item.high), "low": float(item.low), "close": float(item.close), "volume": item.volume} for item in rows]),
-                    futures_frame,
-                )
+                spot_frame = pd.DataFrame([{"timestamp": item.timestamp, "open": float(item.open), "high": float(item.high), "low": float(item.low), "close": float(item.close), "volume": item.volume, "india_vix": item.india_vix} for item in rows])
+                frame = with_futures_features(spot_frame, futures_frame)
                 candle = rows[-1]
-                decision = decide(frame.iloc[-1], {"india_vix": candle.india_vix, "futures_basis_pct": candle.futures_basis_pct, "pcr": candle.pcr}, self.model)
+                if use_setup_model:
+                    if code not in self.setup_model.models:
+                        continue
+                    relative_code = relative_index_code(code)
+                    relative_rows = session.scalars(select(Candle).where(Candle.provider == provider, Candle.underlying_code == relative_code, Candle.data_role == "SPOT", Candle.timeframe == "5minute", Candle.timestamp < boundary).order_by(Candle.timestamp.desc()).limit(240)).all()[::-1]
+                    relative_frame = pd.DataFrame([{"timestamp": item.timestamp, "open": float(item.open), "high": float(item.high), "low": float(item.low), "close": float(item.close), "volume": item.volume} for item in relative_rows])
+                    setup_rows = setup_rule_candidates(spot_frame, futures_frame, code, relative_frame=relative_frame)
+                    if setup_rows.empty:
+                        continue
+                    setup = setup_rows.iloc[-1]
+                    setup_time = pd.Timestamp(setup.timestamp)
+                    candle_time = pd.Timestamp(candle.timestamp)
+                    setup_time = setup_time.tz_localize("UTC") if setup_time.tzinfo is None else setup_time.tz_convert("UTC")
+                    candle_time = candle_time.tz_localize("UTC") if candle_time.tzinfo is None else candle_time.tz_convert("UTC")
+                    if setup_time != candle_time:
+                        continue
+                    model_decision, probability = self.setup_model.predict(code, {name: float(setup[name]) for name in SETUP_FEATURES})
+                    if model_decision != "TAKE":
+                        self._record_signal_rejection(session, provider=provider, mode=runtime.execution_mode, code=code, stamp=candle.timestamp, stage="SETUP_MODEL", reason="TAKE/SKIP model rejected the rule candidate", details={"probability": probability, "threshold": self.setup_model.thresholds[code]})
+                        continue
+                    decision = Decision("SETUP_QUALITY", probability, str(setup.direction), "Rule candidate accepted by TAKE/SKIP model", {name: float(setup[name]) for name in SETUP_FEATURES})
+                else:
+                    decision = decide(frame.iloc[-1], {"india_vix": candle.india_vix, "futures_basis_pct": candle.futures_basis_pct, "pcr": candle.pcr}, self.model)
                 if decision.direction == "NO_TRADE":
                     signal_id = f"reject-{provider.lower()}-{code}-{int(candle.timestamp.timestamp())}"
                     if not session.get(Signal, signal_id): session.add(Signal(provider=provider, id=signal_id, mode=runtime.execution_mode, underlying_code=code, candle_timestamp=candle.timestamp, direction="NO_TRADE", regime=decision.regime, confidence=decision.confidence, status="REJECTED", rejection_reason=decision.reason, decision_json=json.dumps({"features": decision.features, "checks": {"confidence": decision.confidence >= .70, "above_futures_vwap": float(frame.iloc[-1].futures_close) > float(frame.iloc[-1].futures_vwap), "ema9_above_ema20": float(frame.iloc[-1].ema9) > float(frame.iloc[-1].ema20), "breakout": float(frame.iloc[-1].close) > float(frame.iloc[-1].opening_range_high)}}, default=str)))
@@ -341,7 +641,8 @@ class RuntimeService:
             _, code, candle, decision, selection, row = candidates[0]
             atr = Decimal(str(row.atr))
             underlying_stop = Decimal(candle.close) - atr if decision.direction == "CE" else Decimal(candle.close) + atr
-            await self.execution.enter(session, underlying_code=code, candle_time=candle.timestamp, regime=decision.regime, confidence=decision.confidence, direction=decision.direction, underlying_price=Decimal(candle.close), underlying_stop=underlying_stop, contract=selection.contract, quote=selection.quote, moneyness=selection.moneyness, decision_context={"features": decision.features, "reason": decision.reason, "checks": {"confidence": decision.confidence >= .70, "futures_vwap": f"{row.futures_close} vs {row.futures_vwap}", "ema9_20": f"{row.ema9} vs {row.ema20}", "opening_range": f"{row.close} / {row.opening_range_high} / {row.opening_range_low}"}, "selection": {"instrument": selection.contract.instrument_key, "symbol": selection.contract.trading_symbol, "strike": str(selection.contract.strike), "moneyness": selection.moneyness, "bid": str(selection.quote.bid), "ask": str(selection.quote.ask), "delta": selection.quote.delta, "iv": selection.quote.iv}})
+            required_confidence = self.setup_model.thresholds.get(code, .70) if decision.regime == "SETUP_QUALITY" else .70
+            await self.execution.enter(session, underlying_code=code, candle_time=candle.timestamp, regime=decision.regime, confidence=decision.confidence, direction=decision.direction, underlying_price=Decimal(candle.close), underlying_stop=underlying_stop, contract=selection.contract, quote=selection.quote, moneyness=selection.moneyness, decision_context={"features": decision.features, "reason": decision.reason, "checks": {"confidence": decision.confidence >= required_confidence, "required_confidence": required_confidence, "futures_vwap": f"{row.futures_close} vs {row.futures_vwap}", "ema9_20": f"{row.ema9} vs {row.ema20}", "opening_range": f"{row.close} / {row.opening_range_high} / {row.opening_range_low}"}, "selection": {"instrument": selection.contract.instrument_key, "symbol": selection.contract.trading_symbol, "strike": str(selection.contract.strike), "moneyness": selection.moneyness, "bid": str(selection.quote.bid), "ask": str(selection.quote.ask), "delta": selection.quote.delta, "iv": selection.quote.iv}})
 
     async def monitor(self) -> None:
         with self.session_factory() as session:
@@ -447,12 +748,14 @@ class RuntimeService:
                     await asyncio.sleep(5); continue
                 if self.last_instrument_refresh != (provider, date.today()): await self.refresh_instruments(provider)
                 await self.monitor()
+                await self.monitor_shadow()
                 await self.validate_live_reconciliation()
                 now = datetime.now(UTC)
                 boundary = now.replace(second=0, microsecond=0, minute=now.minute // 5 * 5)
                 if now.second >= 10 and boundary != last_boundary:
                     await self.validate_live_token()
                     await self.sync_candles()
+                    await self.process_shadow_signals(boundary)
                     await self.process_signals(boundary)
                     last_boundary = boundary
                 self.last_error = None

@@ -62,16 +62,18 @@ def labelled_samples(
         [enriched.low.groupby(local_day).shift(-step) for step in range(1, horizon + 1)], axis=1
     ).min(axis=1)
     move = future_closes - enriched.close
-    threshold = enriched.atr * 0.65
-    future_range = future_high - future_low
+    # Labels match the actual action space: buy a call, buy a put, or abstain.
+    # Requiring a larger terminal move and a bounded adverse excursion removes
+    # noisy regimes that could not survive realistic option execution costs.
+    threshold = enriched.atr * 0.80
+    maximum_adverse_excursion = enriched.atr * 0.75
     labels = np.select(
         [
-            move >= threshold,
-            move <= -threshold,
-            (move.abs() < threshold) & (future_range >= enriched.atr * 2.0),
+            (move >= threshold) & ((enriched.close - future_low) <= maximum_adverse_excursion),
+            (move <= -threshold) & ((future_high - enriched.close) <= maximum_adverse_excursion),
         ],
-        ["UPTREND", "DOWNTREND", "HIGH_VOLATILITY"],
-        default="RANGE",
+        ["UPTREND", "DOWNTREND"],
+        default="NO_TRADE",
     )
     feature_rows = [feature_values(row) for _, row in enriched.iterrows()]
     samples = pd.DataFrame(feature_rows, index=enriched.index)
@@ -82,7 +84,44 @@ def labelled_samples(
     return samples.loc[finite].reset_index(drop=True)
 
 
-def front_future_frame(candles: list[Candle], instruments: list[Instrument]) -> pd.DataFrame:
+def _apply_temperature(probabilities: np.ndarray, temperature: float) -> np.ndarray:
+    powered = np.power(np.clip(probabilities, 1e-12, 1.0), 1.0 / temperature)
+    return powered / powered.sum(axis=1, keepdims=True)
+
+
+def _probability_temperature(probabilities: np.ndarray, labels: np.ndarray) -> float:
+    """Select a simple temperature on a chronological tuning set."""
+    if not len(labels):
+        return 1.0
+    best_temperature, best_loss = 1.0, float("inf")
+    rows = np.arange(len(labels))
+    for temperature in np.linspace(0.50, 3.00, 51):
+        calibrated = _apply_temperature(probabilities, float(temperature))
+        loss = -float(np.log(np.clip(calibrated[rows, labels], 1e-12, 1.0)).mean())
+        if loss < best_loss:
+            best_temperature, best_loss = float(temperature), loss
+    return best_temperature
+
+
+def candidate_quality_issues(metadata: dict) -> list[str]:
+    """Return reasons a candidate is unsafe to activate."""
+    issues: list[str] = []
+    balanced_accuracy = float(metadata.get("balanced_accuracy") or 0.0)
+    directional = metadata.get("directional_validation") or {}
+    predictions = int(directional.get("predictions_above_70_percent") or 0)
+    precision = directional.get("precision_above_70_percent")
+    if balanced_accuracy < 0.38:
+        issues.append("balanced validation accuracy is below 38%")
+    if predictions < 100:
+        issues.append("fewer than 100 directional holdout predictions reached 70% confidence")
+    if precision is None or float(precision) < 0.55:
+        issues.append("directional precision at 70% confidence is below 55%")
+    return issues
+
+
+def front_future_frame(
+    candles: list[Candle], instruments: list[Instrument], *, include_expiry: bool = False
+) -> pd.DataFrame:
     expiries = {item.instrument_key: item.expiry for item in instruments}
     rows = []
     for candle in candles:
@@ -108,9 +147,11 @@ def front_future_frame(candles: list[Candle], instruments: list[Instrument]) -> 
             }
         )
     if not rows:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        columns = ["timestamp", "open", "high", "low", "close", "volume"]
+        return pd.DataFrame(columns=[*columns, "expiry"] if include_expiry else columns)
     frame = pd.DataFrame(rows).sort_values(["timestamp", "expiry"])
-    return frame.drop_duplicates("timestamp", keep="first").drop(columns=["expiry"]).reset_index(drop=True)
+    frame = frame.drop_duplicates("timestamp", keep="first").reset_index(drop=True)
+    return frame if include_expiry else frame.drop(columns=["expiry"])
 
 
 def train_regime_model(
@@ -208,13 +249,19 @@ def train_regime_model(
     class_to_id = {name: index for index, name in enumerate(classes)}
     labels = dataset.label.map(class_to_id).to_numpy(dtype=int)
     matrix = dataset[PRICE_FEATURES].to_numpy(dtype=float)
-    split, validation_start, _ = day_split_indices(dataset.timestamp, 0.8)
-    train_x, validation_x = matrix[:split], matrix[validation_start:]
-    train_y, validation_y = labels[:split], labels[validation_start:]
+    fit_end, tuning_start, _ = day_split_indices(dataset.timestamp, 0.7, 0.1)
+    _, validation_start, _ = day_split_indices(dataset.timestamp, 0.8)
+    train_x, tuning_x, validation_x = (
+        matrix[:fit_end], matrix[tuning_start:validation_start], matrix[validation_start:]
+    )
+    train_y, tuning_y, validation_y = (
+        labels[:fit_end], labels[tuning_start:validation_start], labels[validation_start:]
+    )
 
     counts = Counter(train_y.tolist())
     weights = np.array([len(train_y) / (len(counts) * counts[value]) for value in train_y], dtype=float)
     train_matrix = xgb.DMatrix(train_x, label=train_y, weight=weights, feature_names=PRICE_FEATURES)
+    tuning_matrix = xgb.DMatrix(tuning_x, label=tuning_y, feature_names=PRICE_FEATURES)
     validation_matrix = xgb.DMatrix(validation_x, label=validation_y, feature_names=PRICE_FEATURES)
     model_params = {
         "objective": "multi:softprob",
@@ -224,17 +271,28 @@ def train_regime_model(
         "max_depth": 4,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
+        "min_child_weight": 4,
+        "lambda": 1.5,
         "seed": 42,
         "nthread": 1,
     }
     booster = xgb.train(
         model_params,
         train_matrix,
-        num_boost_round=220,
-        evals=[(validation_matrix, "validation")],
+        num_boost_round=800,
+        evals=[(tuning_matrix, "tuning")],
+        early_stopping_rounds=40,
         verbose_eval=False,
     )
-    validation_probabilities = booster.predict(validation_matrix)
+    best_rounds = int(booster.best_iteration) + 1
+    tuning_probabilities = booster.predict(
+        tuning_matrix, iteration_range=(0, best_rounds)
+    )
+    probability_temperature = _probability_temperature(tuning_probabilities, tuning_y)
+    validation_probabilities = _apply_temperature(
+        booster.predict(validation_matrix, iteration_range=(0, best_rounds)),
+        probability_temperature,
+    )
     predictions = np.argmax(validation_probabilities, axis=1)
     accuracy = float(np.mean(predictions == validation_y)) if len(validation_y) else 0.0
     per_class_accuracy = []
@@ -283,7 +341,7 @@ def train_regime_model(
         fold_model = xgb.train(
             model_params,
             fold_train,
-            num_boost_round=120,
+            num_boost_round=best_rounds,
             verbose_eval=False,
         )
         fold_predictions = np.argmax(fold_model.predict(fold_validation), axis=1)
@@ -311,7 +369,7 @@ def train_regime_model(
         [len(labels) / (len(full_counts) * full_counts[value]) for value in labels], dtype=float
     )
     full_matrix = xgb.DMatrix(matrix, label=labels, weight=full_weights, feature_names=PRICE_FEATURES)
-    booster = xgb.train(model_params, full_matrix, num_boost_round=220, verbose_eval=False)
+    booster = xgb.train(model_params, full_matrix, num_boost_round=best_rounds, verbose_eval=False)
     importance = booster.get_score(importance_type="gain")
     trained_at = datetime.now(UTC)
     metadata = {
@@ -328,11 +386,14 @@ def train_regime_model(
         "classes": classes,
         "samples": len(dataset),
         "training_samples": len(dataset),
-        "validation_fit_samples": split,
+        "validation_fit_samples": fit_end,
         "fitted_through": pd.Timestamp(dataset.iloc[-1].timestamp).isoformat(),
-        "validation_model_fitted_through": pd.Timestamp(dataset.iloc[split - 1].timestamp).isoformat(),
+        "validation_model_fitted_through": pd.Timestamp(dataset.iloc[fit_end - 1].timestamp).isoformat(),
+        "tuning_samples": len(tuning_y),
+        "tuning_start": pd.Timestamp(dataset.iloc[tuning_start].timestamp).isoformat(),
+        "tuning_end": pd.Timestamp(dataset.iloc[validation_start - 1].timestamp).isoformat(),
         "validation_samples": len(dataset) - validation_start,
-        "purged_samples": validation_start - split,
+        "purged_samples": tuning_start - fit_end,
         "validation_start": pd.Timestamp(dataset.iloc[validation_start].timestamp).isoformat(),
         "validation_accuracy": round(accuracy, 4),
         "balanced_accuracy": round(balanced_accuracy, 4),
@@ -343,6 +404,8 @@ def train_regime_model(
             "mean": round(float(np.mean(confidence)), 4) if len(confidence) else 0.0,
             "above_70_percent": round(float(np.mean(confidence >= 0.70) * 100), 2) if len(confidence) else 0.0,
         },
+        "probability_temperature": round(probability_temperature, 4),
+        "boosting_rounds": best_rounds,
         "directional_validation": {
             "predictions_above_70_percent": int(directional_confident.sum()),
             "precision_above_70_percent": round(float(directional_correct[directional_confident].mean()), 4)
@@ -354,6 +417,10 @@ def train_regime_model(
         "label_horizon_bars": 6,
         "uses_live_context": False,
         "coverage": diagnostics,
+    }
+    metadata["activation_quality"] = {
+        "ready": not candidate_quality_issues(metadata),
+        "issues": candidate_quality_issues(metadata),
     }
     model_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_model = model_path.with_name(f".{model_path.stem}.tmp.json")
