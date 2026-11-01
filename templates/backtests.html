@@ -53,13 +53,14 @@
 <div class="grid-two research-tools">
   <section id="download-data" class="card form-card workflow-card">
     <div class="step-heading"><span>1</span><div><h2>Download historical data</h2><p>Get verified market candles and store them in SQLite.</p></div></div>
-    <form method="post" action="/backtests/sync-data" class="form-stack">
+    <form method="post" action="/backtests/sync-data" class="form-stack" id="research-download-form">
       <input type="hidden" name="historical_provider" value="{{ active_broker }}">
       <div class="selected-source"><span>Download from</span><b>{{ active_broker }}</b></div>
       <fieldset><legend>Indices</legend><label class="check"><input type="checkbox" name="indices" value="NIFTY" checked>NIFTY 50</label><label class="check"><input type="checkbox" name="indices" value="BANK_NIFTY" checked>BANK NIFTY</label><label class="check"><input type="checkbox" name="indices" value="SENSEX" checked>SENSEX</label></fieldset>
       <div class="form-grid"><label>From<input type="date" name="start_date" required></label><label>To<input type="date" name="end_date" required></label></div>
       <label class="card-check check"><input type="checkbox" name="include_options" value="true"><span>Include expired options<small>Required for trustworthy historical CE/PE profit and loss. Several years can take hours because each selected contract needs its own broker request; the run shows contract-level progress below.</small></span></label>
       <details class="advanced-settings"><summary>Advanced download options</summary><label class="card-check check"><input type="checkbox" name="include_one_minute" value="true"><span>Include one-minute index candles<small>Used only when stop and target occur inside the same five-minute candle.</small></span></label><label class="card-check check"><input type="checkbox" name="repair_only" value="true"><span>Repair known gaps only<small>Requests only detected intraday gaps for stored instruments; new instruments still receive a complete download.</small></span></label></details>
+      {% if active_broker == 'GROWW' %}<div class="button-row"><button type="button" class="button small secondary" data-repair-range="training">Fill 2023–25 training repair</button><button type="button" class="button small secondary" data-repair-range="backtest">Fill 2026 backtest repair</button></div><p class="hint">Run the training repair first, then the backtest repair when the first download finishes. Both presets select all three indices and expired options.</p>{% endif %}
       <button class="button secondary">Download data</button>
     </form>
   </section>
@@ -187,12 +188,24 @@
   <div class="disclosure-content">
     <div class="table-wrap"><table><thead><tr><th>Provider / index</th><th>Spot</th><th>Futures</th><th>Aligned</th><th>Options</th><th>Contract metadata</th><th>Detected gaps</th><th>Ready</th></tr></thead><tbody>{% for row in data_readiness %}{% if row.spot_count or row.futures_count or row.option_count %}<tr><td><b>{{ row.provider }}</b><small>{{ row.underlying_code|replace('_',' ') }} · {{ row.first_timestamp or '—' }} → {{ row.last_timestamp or '—' }}</small></td><td>{{ row.spot_count }}<small>{{ row.zero_volume_percent }}% zero volume{% if row.zero_volume_percent == 100 %} · expected for cash index{% endif %}</small></td><td>{{ row.futures_count }}</td><td>{{ row.aligned_count }}<small>{{ row.alignment_percent }}%</small></td><td>{{ row.option_count }}</td><td>{{ row.verified_contracts }} verified<small>{{ row.pending_contracts }} pending · {{ row.metadata_gap_contracts }} unmatched</small></td><td>{{ row.spot_missing_intervals }} spot · {{ row.futures_missing_intervals }} futures<small>{% if row.first_missing_timestamp %}{{ row.first_missing_timestamp }} → {{ row.last_missing_timestamp }}{% else %}No known intraday gaps{% endif %}</small></td><td><span class="status {{ 'green' if row.backtest_ready else ('blue' if row.training_ready else 'amber') }}">{{ 'BACKTEST' if row.backtest_ready else ('TRAINING' if row.training_ready else 'NOT READY') }}</span><small>{{ row.reason }}</small></td></tr>{% endif %}{% else %}<tr><td colspan="8" class="empty-row">No research candles downloaded.</td></tr>{% endfor %}</tbody></table></div>
     <hr>
-    <div class="metadata-tools"><div><h3>Historical contract metadata</h3><p class="hint">Import only lot size and tick size verified from an exchange or broker archive. NiftyPilot never guesses historical lot sizes.</p></div><form method="post" action="/backtests/contract-metadata" enctype="multipart/form-data" class="metadata-form"><label>Completed metadata CSV<input type="file" name="metadata_file" accept=".csv,text/csv" required></label><div class="button-row"><a class="button small secondary" href="/backtests/contract-metadata.csv">Export pending CSV</a><button class="button secondary">Import verified CSV</button></div></form></div>
+    <div class="metadata-tools"><div><h3>Historical contract metadata</h3><p class="hint">Verify dated lot sizes and option ticks for GROWW NIFTY, BANK NIFTY and SENSEX from 2023 through October 2026. Contracts spanning a lot change get separate date versions. Ambiguous contracts remain pending. Sources: <a href="https://archives.nseindia.com/content/circulars/FAOP56233.pdf" target="_blank" rel="noopener noreferrer">NSE 2023</a> · <a href="https://nsearchives.nseindia.com/content/circulars/FAOP61415.pdf" target="_blank" rel="noopener noreferrer">NSE 2024</a> · <a href="https://nsearchives.nseindia.com/content/circulars/FAOP67372.pdf" target="_blank" rel="noopener noreferrer">NSE 2025</a> · <a href="https://nsearchives.nseindia.com/content/circulars/FAOP70616.pdf" target="_blank" rel="noopener noreferrer">NSE 2026 lots</a> · <a href="https://www.bseindia.com/markets/MarketInfo/DispNewNoticesCirculars.aspx?page=20241021-13" target="_blank" rel="noopener noreferrer">BSE Sensex</a>.</p><form method="post" action="/backtests/verify-index-contract-metadata"><button class="button secondary">Verify all three indices from exchange notices</button></form><p class="hint">This verifies contract sizes; use the two download repair ranges above for missing candles. Earlier download entries keep their original status.</p></div><form method="post" action="/backtests/contract-metadata" enctype="multipart/form-data" class="metadata-form"><label>Completed metadata CSV<input type="file" name="metadata_file" accept=".csv,text/csv" required></label><div class="button-row"><a class="button small secondary" href="/backtests/contract-metadata.csv">Export pending CSV</a><button class="button secondary">Import verified CSV</button></div></form></div>
   </div>
 </details>
 
 {% if selected %}{% include "partials/backtest_result.html" %}{% endif %}
 <script>
+  document.querySelectorAll('[data-repair-range]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      const form = document.getElementById('research-download-form');
+      const training = button.dataset.repairRange === 'training';
+      form.elements.start_date.value = training ? '2023-01-01' : '2026-01-01';
+      form.elements.end_date.value = training ? '2025-12-31' : '2026-10-31';
+      form.querySelectorAll('input[name="indices"]').forEach(input => { input.checked = true; });
+      form.elements.include_options.checked = true;
+      form.elements.repair_only.checked = true;
+      form.elements.include_one_minute.checked = false;
+    });
+  });
   document.getElementById('setup-training-form')?.addEventListener('submit', function (event) {
     if (event.submitter?.id !== 'check-setup-data') return;
     document.getElementById('check-setup-progress').hidden = false;

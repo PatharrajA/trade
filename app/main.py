@@ -26,6 +26,7 @@ from .groww import GrowwClient
 from .model_registry import activate_candidate, register_candidate
 from .mode_control import change_mode, reconcile
 from .models import BacktestRun, BacktestTrade, Candle, Instrument, ModelArtifact, Order, ResearchSyncRun, RuntimeSetting, Setting, ShadowObservation, SystemEvent, Trade
+from .historical_metadata import REPAIR_END, REPAIR_START, verify_historical_contract_metadata
 from .providers import provider_name
 from .operations import backup_status, file_permission_status
 from .research_jobs import ResearchJobService
@@ -418,6 +419,30 @@ def pending_contract_metadata_csv(session: Session = Depends(get_session)):
         output.getvalue(),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=pending-contract-metadata.csv"},
+    )
+
+
+@app.post("/backtests/verify-nifty-2023-2024-metadata")
+@app.post("/backtests/verify-index-contract-metadata")
+def verify_index_contract_metadata(session: Session = Depends(get_session)):
+    result = verify_historical_contract_metadata(session)
+    remaining = session.scalar(
+        select(func.count(Instrument.id)).where(
+            Instrument.provider == "GROWW",
+            Instrument.underlying_code.in_(("NIFTY", "BANK_NIFTY", "SENSEX")),
+            Instrument.instrument_kind == "OPTION",
+            Instrument.metadata_verified.is_(False),
+            Instrument.valid_from <= REPAIR_END,
+            (Instrument.valid_to.is_(None) | (Instrument.valid_to >= REPAIR_START)),
+            Instrument.expiry > REPAIR_START,
+        )
+    ) or 0
+    session.commit()
+    return flash_redirect(
+        "/backtests",
+        f"Exchange notices verified/corrected {result.corrected_versions} index option versions; "
+        f"{result.split_contracts} contracts split at lot changes; "
+        f"{remaining} versions still need a dated source.",
     )
 
 
