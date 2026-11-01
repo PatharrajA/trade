@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from .data_quality import _missing_timestamps
 from .domain import Contract
+from .groww import GrowwError
 from .models import Candle, Instrument
 from .option_selector import atm_itm1_strikes, expected_atm_strike
 from .providers import BrokerClient, provider_name
@@ -189,12 +190,26 @@ async def _store_candles(
                 gap_days.update(required_dates - stored_days)
             gap_days = sorted(day for day in gap_days if start <= day <= end)
             ranges = [(day, day) for day in gap_days]
-    for chunk_start, chunk_end in ranges:
-        rows = (
-            await client.historical_option_candles(contract, chunk_start, chunk_end, minutes)
-            if contract
-            else await client.historical_candles(instrument_key, chunk_start, chunk_end, minutes)
-        )
+    range_index = 0
+    while range_index < len(ranges):
+        chunk_start, chunk_end = ranges[range_index]
+        try:
+            rows = (
+                await client.historical_option_candles(contract, chunk_start, chunk_end, minutes)
+                if contract
+                else await client.historical_candles(instrument_key, chunk_start, chunk_end, minutes)
+            )
+        except GrowwError as exc:
+            timed_out = exc.status_code == 504 or (
+                exc.status_code == 500 and "timeout" in str(exc).lower()
+            )
+            if not timed_out or chunk_start >= chunk_end:
+                raise
+            midpoint = chunk_start + timedelta(days=(chunk_end - chunk_start).days // 2)
+            ranges[range_index:range_index + 1] = [
+                (chunk_start, midpoint), (midpoint + timedelta(days=1), chunk_end)
+            ]
+            continue
         parsed = []
         for row in rows:
             candle = _parse(row)
@@ -203,6 +218,7 @@ async def _store_candles(
                 continue
             parsed.append(candle)
         if not parsed:
+            range_index += 1
             continue
         first_stamp = min(_naive_utc(item[0]) for item in parsed)
         last_stamp = max(_naive_utc(item[0]) for item in parsed)
@@ -243,6 +259,7 @@ async def _store_candles(
                 existing.add(normalized)
                 inserted += 1
             session.commit()
+        range_index += 1
     if rejected and warnings is not None:
         warnings.append(
             f"{provider}: skipped {rejected} malformed {data_role.lower()} candles for {instrument_key}"
@@ -345,6 +362,9 @@ def _repair_issues(
                         Instrument.underlying_code == code,
                         Instrument.instrument_kind == "OPTION",
                         Instrument.metadata_verified.is_(False),
+                        Instrument.valid_from <= end,
+                        (Instrument.valid_to.is_(None) | (Instrument.valid_to >= start)),
+                        Instrument.expiry > start,
                     ).limit(1)
                 )
             if pending_metadata:

@@ -178,6 +178,29 @@ async def test_groww_historical_request_retries_rate_limit(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_groww_historical_request_retries_temporary_server_error(tmp_path):
+    attempts = 0
+
+    def handler(request: httpx.Request):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(500, json={"code": "GA000", "message": "timeout executing GET"})
+        return httpx.Response(200, json={"status": "SUCCESS", "payload": {"candles": []}})
+
+    client = _client(tmp_path, handler)
+    client._historical_min_interval_seconds = 0
+    client._historical_server_retry_delay_seconds = 0
+    try:
+        assert await client.historical_candles(
+            client.index_key("NIFTY"), date(2025, 6, 12), date(2025, 6, 19)
+        ) == []
+        assert attempts == 2
+    finally:
+        await client.client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_groww_quote_ignores_non_numeric_market_placeholders(tmp_path):
     def handler(request: httpx.Request):
         assert request.url.path == "/v1/live-data/quote"

@@ -18,7 +18,9 @@ from .domain import BrokerOrder, Contract, Quote
 
 
 class GrowwError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 GROWW_INDEX_KEYS = {
@@ -50,6 +52,8 @@ class GrowwClient:
         self._last_historical_request_at = 0.0
         self._historical_min_interval_seconds = 0.5
         self._maximum_rate_limit_retries = 5
+        self._maximum_historical_server_retries = 2
+        self._historical_server_retry_delay_seconds = 1.0
 
     def access_token(self) -> str:
         try:
@@ -113,29 +117,41 @@ class GrowwClient:
             return response.text[:160]
 
     async def _json(self, method: str, path: str, **kwargs) -> dict[str, Any]:
-        response: httpx.Response | None = None
-        maximum_retries = (
-            self._maximum_rate_limit_retries if path.startswith("/v1/historical/") else 0
-        )
-        for attempt in range(maximum_retries + 1):
-            response = await self._request(method, path, **kwargs)
-            if response.status_code != 429:
-                break
-            if attempt >= maximum_retries:
-                break
-            retry_after = response.headers.get("Retry-After", "")
+        historical_get = method.upper() == "GET" and path.startswith("/v1/historical/")
+        rate_retries = server_retries = 0
+        while True:
             try:
-                wait_seconds = max(float(retry_after), 0.0)
-            except ValueError:
-                wait_seconds = float(2**attempt)
-            if not retry_after:
-                wait_seconds = float(2**attempt)
-            await asyncio.sleep(min(wait_seconds, 30.0))
+                response = await self._request(method, path, **kwargs)
+            except httpx.TransportError as exc:
+                if not historical_get or server_retries >= self._maximum_historical_server_retries:
+                    raise GrowwError(
+                        f"Groww request failed: {exc}",
+                        status_code=504 if isinstance(exc, httpx.TimeoutException) else None,
+                    ) from exc
+                await asyncio.sleep(self._historical_server_retry_delay_seconds * 2**server_retries)
+                server_retries += 1
+                continue
+            if response.status_code == 429 and historical_get and rate_retries < self._maximum_rate_limit_retries:
+                retry_after = response.headers.get("Retry-After", "")
+                try:
+                    wait_seconds = max(float(retry_after), 0.0) if retry_after else float(2**rate_retries)
+                except ValueError:
+                    wait_seconds = float(2**rate_retries)
+                rate_retries += 1
+                await asyncio.sleep(min(wait_seconds, 30.0))
+                continue
+            if response.status_code in {500, 502, 503, 504} and historical_get and server_retries < self._maximum_historical_server_retries:
+                await asyncio.sleep(self._historical_server_retry_delay_seconds * 2**server_retries)
+                server_retries += 1
+                continue
+            break
 
-        assert response is not None
         if response.is_error:
             detail = self._response_detail(response)
-            raise GrowwError(f"Groww request failed ({response.status_code}){': ' + detail if detail else ''}")
+            raise GrowwError(
+                f"Groww request failed ({response.status_code}){': ' + detail if detail else ''}",
+                status_code=response.status_code,
+            )
         payload = response.json()
         if str(payload.get("status", "SUCCESS")).upper() != "SUCCESS":
             raise GrowwError(str(payload.get("message") or payload.get("error") or "Groww request was unsuccessful"))

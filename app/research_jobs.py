@@ -61,11 +61,19 @@ class ResearchJobService:
                     return
                 run.status = "PARTIAL" if result.incomplete_reasons else "COMPLETE"
                 run.progress_percent = 100
-                run.current_step = (
-                    "Download incomplete; submit the same range to resume"
-                    if result.incomplete_reasons
-                    else "Download complete"
+                counts = (
+                    f"saved {result.underlying_candles} index, "
+                    f"{result.futures_candles} futures, "
+                    f"{result.option_candles} option candles"
                 )
+                if result.incomplete_reasons and all(
+                    "metadata" in reason for reason in result.incomplete_reasons
+                ):
+                    run.current_step = f"Download finished ({counts}); contract metadata pending"
+                elif result.incomplete_reasons:
+                    run.current_step = f"Download incomplete ({counts}); submit the same range to resume"
+                else:
+                    run.current_step = f"Download complete ({counts})"
                 run.result_json = json.dumps(
                     {
                         "spot": result.underlying_candles,

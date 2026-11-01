@@ -5,9 +5,10 @@ import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import Base, Candle
+from app.models import Base, Candle, Instrument
 from app.domain import Contract
-from app.research import _parse, _store_candles, sync_research_data
+from app.groww import GrowwError
+from app.research import _parse, _repair_issues, _store_candles, sync_research_data
 
 
 def test_parse_groww_candle_accepts_null_open_interest():
@@ -31,6 +32,56 @@ def test_parse_groww_candle_rejects_non_numeric_price():
 def test_parse_groww_candle_rejects_non_finite_or_invalid_ohlc():
     assert _parse(["2025-09-24T10:30:00", "NaN", 246.15, 245.05, 245.6, 735060, 0]) is None
     assert _parse(["2025-09-24T10:30:00", 245.95, 244, 245.05, 245.6, 735060, 0]) is None
+
+
+def test_metadata_repair_warning_is_scoped_to_requested_dates(session):
+    session.add(Instrument(
+        provider="GROWW", instrument_key="NIFTY-2025-pending",
+        underlying_code="NIFTY", exchange="NSE", trading_symbol="NIFTY CE",
+        option_type="CE", strike=Decimal("25000"), expiry=date(2025, 6, 19),
+        lot_size=0, tick_size=Decimal("0.05"), valid_from=date(2025, 6, 12),
+        valid_to=date(2025, 6, 19), instrument_kind="OPTION",
+        metadata_verified=False,
+    ))
+    session.commit()
+    factory = sessionmaker(bind=session.get_bind())
+
+    assert _repair_issues(
+        factory, "GROWW", ["NIFTY"], date(2023, 1, 1),
+        date(2023, 12, 12), check_option_metadata=True,
+    ) == []
+    assert _repair_issues(
+        factory, "GROWW", ["NIFTY"], date(2025, 6, 1),
+        date(2025, 6, 30), check_option_metadata=True,
+    ) == ["NIFTY: historical option lot/tick metadata still requires verification"]
+
+
+@pytest.mark.asyncio
+async def test_historical_download_splits_range_after_groww_timeout(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'timeout.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+
+    class TimeoutClient:
+        def __init__(self):
+            self.calls = []
+
+        async def historical_candles(self, _key, start, end, _minutes):
+            self.calls.append((start, end))
+            if start < end:
+                raise GrowwError("Groww request failed (500): timeout executing GET", status_code=500)
+            return [[f"{start}T09:15:00", 100, 101, 99, 100, 0, 0]]
+
+    client = TimeoutClient()
+    inserted = await _store_candles(
+        client, factory, "NSE-NIFTY", "NIFTY",
+        date(2025, 11, 17), date(2025, 11, 20), provider="GROWW",
+    )
+
+    assert inserted == 4
+    assert client.calls[0] == (date(2025, 11, 17), date(2025, 11, 20))
+    assert (date(2025, 11, 17), date(2025, 11, 17)) in client.calls
+    engine.dispose()
 
 
 @pytest.mark.asyncio
