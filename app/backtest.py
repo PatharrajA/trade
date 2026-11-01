@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from .data_quality import option_replay_issue
 from .models import BacktestRun, BacktestTrade, Candle, Instrument
+from .option_selector import atm_itm1_strikes
 from .risk import RiskLimits, can_enter, option_charges, position_size
 from .setup_quality import SETUP_FEATURES, SetupQualityModel, relative_index_code, setup_rule_candidates
 from .strategy import Decision, RegimeModel, decide, rule_only_decide, with_futures_features
@@ -33,6 +34,11 @@ FUNNEL_STAGES = (
     "risk_passed",
     "executed_trades",
 )
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    """SQLite returns naive UTC candles; replay comparisons need aware UTC."""
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def setup_replay_quality_issues(summary: dict, baseline: dict, indices: list[str]) -> list[str]:
@@ -114,7 +120,7 @@ def _funnel_totals(by_index: dict[str, dict]) -> dict:
 
 
 def metrics(rows: list[dict], capital: Decimal) -> dict:
-    ordered = sorted(rows, key=lambda row: row["exit_time"])
+    ordered = sorted(rows, key=lambda row: _utc_datetime(row["exit_time"]))
     equity, peak, max_drawdown = capital, capital, Decimal("0")
     curve: list[float] = []
     for row in ordered:
@@ -142,18 +148,25 @@ def metrics(rows: list[dict], capital: Decimal) -> dict:
     return {"net_pnl": float(total), "return_pct": float(total / capital * 100) if capital else 0, "max_drawdown_pct": float(max_drawdown), "profit_factor": float(sum(wins, Decimal("0")) / abs(sum(losses, Decimal("0")))) if losses else None, "win_rate_pct": len(wins) / len(pnls) * 100 if pnls else 0, "expectancy": float(total / len(pnls)) if pnls else 0, "max_consecutive_losses": max_loss_streak, "trades": len(pnls), "equity_curve": curve, "per_index": {k: float(v) for k, v in by_index.items()}, "atm_itm1": {k: float(v) for k, v in by_moneyness.items()}, "ce_pe": {k: float(v) for k, v in by_option.items()}, "exit_reasons": {k: float(v) for k, v in by_exit.items()}, "monthly": {k: float(v) for k, v in monthly.items()}}
 
 
-def _historical_contract(session: Session, provider: str, code: str, direction: str, day: date, spot: Decimal, policy: str = "ATM_ITM1") -> list[tuple[Instrument, str]]:
+def _historical_contract(
+    session: Session, provider: str, code: str, direction: str, day: date,
+    spot: Decimal, policy: str = "ATM_ITM1", *, rejection_reasons: list[str] | None = None,
+) -> list[tuple[Instrument, str]]:
     available = session.scalars(select(Instrument).where(Instrument.provider == provider, Instrument.underlying_code == code, Instrument.instrument_kind == "OPTION", Instrument.option_type == direction, Instrument.metadata_verified.is_(True), Instrument.lot_size > 0, Instrument.expiry > day, Instrument.valid_from <= day, (Instrument.valid_to.is_(None) | (Instrument.valid_to >= day))).order_by(Instrument.expiry, Instrument.strike)).all()
     if not available:
+        if rejection_reasons is not None:
+            rejection_reasons.append("NO_ELIGIBLE_VERIFIED_CONTRACT")
         return []
     expiry = min(item.expiry for item in available)
     chain = [item for item in available if item.expiry == expiry]
-    strikes = sorted({item.strike for item in chain})
-    atm = min(strikes, key=lambda strike: abs(strike - spot))
-    position = strikes.index(atm)
-    itm = strikes[max(0, position - 1)] if direction == "CE" else strikes[min(len(strikes) - 1, position + 1)]
+    selected_strikes = atm_itm1_strikes(code, spot, direction, [item.strike for item in chain])
+    if selected_strikes is None:
+        if rejection_reasons is not None:
+            rejection_reasons.append("NO_NEAR_ATM_CONTRACT")
+        return []
+    atm, itm = selected_strikes
     result = [(next(item for item in chain if item.strike == atm), "ATM")]
-    if policy == "ATM_ITM1" and itm != atm:
+    if policy == "ATM_ITM1" and itm is not None:
         result.append((next(item for item in chain if item.strike == itm), "ITM1"))
     return result
 
@@ -377,16 +390,26 @@ def run_backtest_job(db_url: str, run_id: int, model_path: str) -> None:
             recorded: list[dict] = []
             position_until: datetime | None = None
             daily: dict[date, dict[str, int | Decimal]] = {}
-            consecutive_losses = 0
             for event in events:
                 row, decision = event["row"], event["decision"]
                 funnel = funnels[event["code"]]
                 local_day = event["time"].astimezone(ZoneInfo("Asia/Kolkata")).date()
-                day_state = daily.setdefault(local_day, {"trades": 0, "pnl": Decimal("0")})
+                day_state = daily.setdefault(
+                    local_day, {"trades": 0, "pnl": Decimal("0"), "consecutive_losses": 0}
+                )
                 cutoff = datetime.combine(local_day, time(15, 20), tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(UTC)
-                contract_choices = _historical_contract(session, provider, event["code"], decision.direction, local_day, Decimal(str(row.close)), strike_policy)
+                contract_rejections: list[str] = []
+                contract_choices = _historical_contract(
+                    session, provider, event["code"], decision.direction,
+                    local_day, Decimal(str(row.close)), strike_policy,
+                    rejection_reasons=contract_rejections,
+                )
                 if not contract_choices:
-                    _reject(funnel, stage="eligible_contracts", reason="NO_ELIGIBLE_VERIFIED_CONTRACT", event=event)
+                    _reject(
+                        funnel, stage="eligible_contracts",
+                        reason=contract_rejections[0] if contract_rejections else "NO_ELIGIBLE_VERIFIED_CONTRACT",
+                        event=event,
+                    )
                     continue
                 funnel["eligible_contracts"] += 1
                 chosen = None
@@ -455,7 +478,7 @@ def run_backtest_job(db_url: str, run_id: int, model_path: str) -> None:
                 if position_until and event["time"] <= position_until:
                     _reject(funnel, stage="risk", reason="POSITION_ALREADY_OPEN", event=event, attempts=attempts)
                     continue
-                permitted, risk_reason = can_enter(limits=limits, open_positions=0, trades_today=int(day_state["trades"]), consecutive_losses=consecutive_losses, realized_pnl_today=Decimal(day_state["pnl"]), quote_fresh=True, broker_connected=True, reconciled=True)
+                permitted, risk_reason = can_enter(limits=limits, open_positions=0, trades_today=int(day_state["trades"]), consecutive_losses=int(day_state["consecutive_losses"]), realized_pnl_today=Decimal(day_state["pnl"]), quote_fresh=True, broker_connected=True, reconciled=True)
                 if not permitted:
                     _reject(funnel, stage="risk", reason=risk_reason.upper().replace(" ", "_").replace("-", "_"), event=event, attempts=attempts)
                     continue
@@ -482,10 +505,10 @@ def run_backtest_job(db_url: str, run_id: int, model_path: str) -> None:
                     )
                     .order_by(Candle.timestamp)
                 ).all()
-                underlying_by_time = {bar.timestamp.replace(tzinfo=UTC) if bar.timestamp.tzinfo is None else bar.timestamp.astimezone(UTC): bar for bar in underlying_bars}
+                underlying_by_time = {_utc_datetime(bar.timestamp): bar for bar in underlying_bars}
                 resolution_timeframe = "5minute"
                 for bar in bars[1:]:
-                    bar_time = bar.timestamp.replace(tzinfo=UTC) if bar.timestamp.tzinfo is None else bar.timestamp.astimezone(UTC)
+                    bar_time = _utc_datetime(bar.timestamp)
                     underlying = underlying_by_time.get(bar_time)
                     premium_stop_hit = Decimal(bar.low) <= plan.premium_stop
                     stop_hit = underlying and ((decision.direction == "CE" and underlying.low <= underlying_stop) or (decision.direction == "PE" and underlying.high >= underlying_stop))
@@ -526,11 +549,12 @@ def run_backtest_job(db_url: str, run_id: int, model_path: str) -> None:
                     local_day,
                     instrument.exchange,
                 )
-                recorded.append({"exit_time": exit_bar.timestamp, "underlying_code": event["code"], "option_type": decision.direction, "moneyness": moneyness, "net_pnl": net, "stress_net_pnl": stress_net, "exit_reason": exit_reason})
+                exit_time = _utc_datetime(exit_bar.timestamp)
+                recorded.append({"exit_time": exit_time, "underlying_code": event["code"], "option_type": decision.direction, "moneyness": moneyness, "net_pnl": net, "stress_net_pnl": stress_net, "exit_reason": exit_reason})
                 day_state["trades"] = int(day_state["trades"]) + 1
                 day_state["pnl"] = Decimal(day_state["pnl"]) + net
-                consecutive_losses = consecutive_losses + 1 if net < 0 else 0
-                position_until = exit_bar.timestamp
+                day_state["consecutive_losses"] = int(day_state["consecutive_losses"]) + 1 if net < 0 else 0
+                position_until = exit_time
                 if events:
                     run.progress_percent = min(95, 35 + int(len(recorded) / len(events) * 60))
                     session.commit()

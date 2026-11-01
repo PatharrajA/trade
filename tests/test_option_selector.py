@@ -2,7 +2,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from app.domain import Contract, Quote
-from app.option_selector import select_option
+from app.option_selector import atm_itm1_strikes, select_option
 
 
 def contract(strike: str, option_type: str = "CE") -> Contract:
@@ -63,3 +63,24 @@ def test_future_dated_quote_is_rejected():
 
     assert selected.contract is None
     assert "future-dated quote" in selected.reason
+
+
+def test_missing_true_atm_does_not_select_distant_contract():
+    item = contract("26000")
+    selected = select_option(
+        [item], {item.instrument_key: quote(item)},
+        spot=Decimal("25010"), direction="CE", trading_day=date.today(),
+    )
+
+    assert selected.contract is None
+    assert "Near-ATM strike missing" in selected.reason
+
+
+def test_itm1_must_be_the_adjacent_strike():
+    assert atm_itm1_strikes(
+        "NIFTY", Decimal("25010"), "CE",
+        [Decimal("25000"), Decimal("24800")],
+    ) == (Decimal("25000"), None)
+    assert atm_itm1_strikes(
+        "SENSEX", Decimal("83000"), "CE", [Decimal("91100")]
+    ) is None

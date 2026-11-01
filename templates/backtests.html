@@ -76,7 +76,7 @@
         <label>Tune through<input type="date" name="tuning_end" value="{{ training_dates.tuning_end if training_dates else '2025-06-30' }}" required></label>
         <label>Holdout through<input type="date" name="holdout_end" value="{{ training_dates.holdout_end if training_dates else '2025-12-31' }}" required></label>
       </div>
-      <div class="notice">Verified option-price outcomes are required for activation. If option coverage is incomplete, training clearly marks the model as a research-only underlying-price proxy.</div>
+      <div class="notice">Training replays each option trade through its stop, target or 15:20 time exit. Historical option candles need verified contract metadata. When bid/ask history is missing, results use candle prices with estimated slippage. Incomplete option coverage marks the model as a research-only underlying-price proxy.</div>
       <button class="button secondary" type="submit" formaction="/backtests/check-setup-data" id="check-setup-data">Check training data</button>
       <p class="hint" id="check-setup-progress" role="status" hidden>Checking stored candles and option outcomes. This can take several minutes when option history is available.</p>
       <button class="button primary" type="submit">Train TAKE/SKIP models</button>
@@ -92,11 +92,13 @@
   <p class="hint">{{ item.spot_candles }} verified spot candles · {{ item.futures_candles }} {{ item.futures_count_label }}</p>
   {% if item.issue %}<div class="notice error">{{ item.issue }}</div>{% endif %}
   {% if item.periods %}
-  <div class="table-wrap"><table><thead><tr><th>Period</th><th>Dates</th><th>Rule setups</th><th>Verified option outcomes</th><th>Coverage</th></tr></thead><tbody>
+  <div class="table-wrap"><table><thead><tr><th>Period</th><th>Dates</th><th>Rule setups</th><th>Option replay outcomes</th><th>Coverage</th></tr></thead><tbody>
     {% for period in item.periods %}<tr><td>{{ period.name }}</td><td>{{ period.start }} → {{ period.end }}</td><td>{{ period.candidates if period.candidates is not none else 'Not counted' }}</td><td>{{ period.labelled }}</td><td><span class="status {{ 'green' if period.ready else 'red' }}">{% if period.coverage_pct is not none %}{{ period.coverage_pct }}%{% else %}Unavailable{% endif %}</span>{% if not period.ready and period.candidates is not none %}<small>Need sufficient setups and ≥90% coverage</small>{% endif %}</td></tr>{% endfor %}
   </tbody></table></div>
+  {% if item.bid_ask_rows is defined %}<p class="hint">Option exits follow the premium stop, underlying stop/target and 15:20 time exit. {{ item.bid_ask_rows }} outcomes use historical bid/ask; {{ item.estimated_fill_rows }} use option candle prices with estimated two-sided slippage.{% if item.ambiguous_intrabar_rows %} {{ item.ambiguous_intrabar_rows }} use the conservative stop-first rule when stop and target touch the same five-minute candle.{% endif %}</p>{% endif %}
   {% if item.rejections %}<p class="hint">Missing outcomes: {% for reason,count in item.rejections.items() %}{{ reason|replace('_', ' ') }} {{ count }}{% if not loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
-  {% if item.missing_examples %}<details class="advanced-settings"><summary>First {{ item.missing_examples|length }} missing setup examples</summary><div class="table-wrap"><table><thead><tr><th>Date</th><th>Direction</th><th>Expiry</th><th>ATM / ITM1</th><th>Missing</th></tr></thead><tbody>{% for gap in item.missing_examples %}<tr><td>{{ gap.date }}<small>{{ gap.entry_time }}</small></td><td>{{ gap.direction }}</td><td>{{ gap.expiry or '—' }}</td><td>{{ gap.atm or '—' }} / {{ gap.itm1 or '—' }}</td><td>{{ gap.reason|replace('_', ' ') }}</td></tr>{% endfor %}</tbody></table></div></details>{% endif %}
+  {% if item.rejections.get('NO_NEAR_ATM_CONTRACT') %}<p class="hint">Nearby option strikes are missing for these setups. Run an expired-options repair for the same dates, then check again. If the broker archive cannot provide those contracts, this period cannot be used for verified option training.</p>{% endif %}
+  {% if item.missing_examples %}<details class="advanced-settings"><summary>First {{ item.missing_examples|length }} missing setup examples</summary><div class="table-wrap"><table><thead><tr><th>Date</th><th>Direction</th><th>Expiry</th><th>ATM / ITM1</th><th>Missing</th></tr></thead><tbody>{% for gap in item.missing_examples %}<tr><td>{{ gap.date }}<small>{{ gap.signal_time or gap.entry_time }}</small></td><td>{{ gap.direction }}</td><td>{{ gap.expiry or '—' }}</td><td>{{ gap.atm or '—' }} / {{ gap.itm1 or '—' }}</td><td>{{ gap.reason|replace('_', ' ') }}</td></tr>{% endfor %}</tbody></table></div></details>{% endif %}
   {% endif %}
   {% endfor %}
   <p class="hint">This check reads stored data only. It does not download candles, train models, or change trading mode.</p>

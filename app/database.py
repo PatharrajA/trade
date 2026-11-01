@@ -113,6 +113,10 @@ def _migrate_research_columns() -> None:
                 )
             )
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_candles_data_role ON candles (data_role)"))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_candle_quality ON candles "
+                "(provider, underlying_code, data_role, timeframe, source_verified, timestamp, instrument_key)"
+            ))
         if "instruments" in tables:
             columns = {column["name"] for column in inspector.get_columns("instruments")}
             if "instrument_kind" not in columns:
@@ -196,6 +200,15 @@ def database_health(session: Session) -> tuple[bool, str]:
     try:
         result = session.execute(text("PRAGMA quick_check")).scalar_one()
         return result == "ok", str(result)
+    except Exception as exc:
+        return False, str(exc)
+
+
+def database_connection_health(session: Session) -> tuple[bool, str]:
+    """Cheap page status; integrity checks still run before Live and in /health."""
+    try:
+        session.execute(text("SELECT 1")).scalar_one()
+        return True, "Connected"
     except Exception as exc:
         return False, str(exc)
 

@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .database import database_health, settings_dict
+from .database import database_connection_health, settings_dict
 from .config import config
 from .data_quality import research_readiness
 from .models import BacktestRun, Candle, Instrument, ModelArtifact, NotificationOutbox, Order, ResearchSyncRun, RuntimeSetting, ShadowObservation, Signal, SystemEvent, Trade
@@ -57,7 +57,7 @@ def dashboard_context(session: Session, runtime_service=None) -> dict:
         if row.exit_time and row.entry_time
     ]
     average_holding_minutes = round(sum(holding_minutes) / len(holding_minutes)) if holding_minutes else 0
-    db_ok, db_detail = database_health(session)
+    db_ok, db_detail = database_connection_health(session)
     per_index = {}
     for code in ("NIFTY", "BANK_NIFTY", "SENSEX"):
         rows = [row for row in closed_month if row.underlying_code == code]
@@ -215,22 +215,25 @@ def backtests_context(session: Session, selected_id: int | None = None) -> dict:
             run_details[run.id] = json.loads(run.configuration_json)
         except (TypeError, ValueError):
             run_details[run.id] = {}
-    verified_underlying = session.scalar(
-        select(func.count()).select_from(Candle).where(Candle.data_role == "SPOT", Candle.source_verified.is_(True))
-    ) or 0
-    verified_futures = session.scalar(
-        select(func.count()).select_from(Candle).where(Candle.data_role == "FUTURE", Candle.source_verified.is_(True))
-    ) or 0
-    verified_options = session.scalar(
-        select(func.count()).select_from(Candle).where(Candle.data_role == "OPTION", Candle.source_verified.is_(True))
-    ) or 0
-    provider_counts = {}
-    for provider in ("UPSTOX", "GROWW"):
-        provider_counts[provider] = {
-            "underlying": session.scalar(select(func.count()).select_from(Candle).where(Candle.provider == provider, Candle.data_role == "SPOT", Candle.source_verified.is_(True))) or 0,
-            "futures": session.scalar(select(func.count()).select_from(Candle).where(Candle.provider == provider, Candle.data_role == "FUTURE", Candle.source_verified.is_(True))) or 0,
-            "options": session.scalar(select(func.count()).select_from(Candle).where(Candle.provider == provider, Candle.data_role == "OPTION", Candle.source_verified.is_(True))) or 0,
-        }
+    verified_counts = {"SPOT": 0, "FUTURE": 0, "OPTION": 0}
+    provider_counts = {
+        provider: {"underlying": 0, "futures": 0, "options": 0}
+        for provider in ("UPSTOX", "GROWW")
+    }
+    role_keys = {"SPOT": "underlying", "FUTURE": "futures", "OPTION": "options"}
+    for provider, _code, role, count in session.execute(
+        select(Candle.provider, Candle.underlying_code, Candle.data_role, func.count(Candle.id))
+        .where(Candle.source_verified.is_(True))
+        .group_by(Candle.provider, Candle.underlying_code, Candle.data_role)
+    ):
+        if role not in role_keys:
+            continue
+        verified_counts[role] += count
+        if provider in provider_counts:
+            provider_counts[provider][role_keys[role]] += count
+    verified_underlying = verified_counts["SPOT"]
+    verified_futures = verified_counts["FUTURE"]
+    verified_options = verified_counts["OPTION"]
     research_runs = session.scalars(
         select(ResearchSyncRun).order_by(ResearchSyncRun.created_at.desc()).limit(10)
     ).all()

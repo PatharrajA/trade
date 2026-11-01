@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -15,6 +16,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
 from .models import Candle, Instrument
+from .option_selector import atm_itm1_strikes
 from .risk import option_charges
 from .strategy import with_futures_features
 from .training import front_future_frame, model_metadata_path
@@ -234,6 +236,8 @@ def _rule_candidates_from_frame(frame: pd.DataFrame, underlying_code: str) -> pd
             active_day = row_day
             bullish_active = False
             bearish_active = False
+        if pd.Timestamp(row.timestamp).tz_convert("Asia/Kolkata").time() >= time(15, 20):
+            continue
         bullish_now = (
             float(row.futures_close) > float(row.futures_vwap)
             and float(row.ema9) > float(row.ema20)
@@ -313,6 +317,15 @@ def setup_candidates(
         path = path[path.timestamp.dt.tz_convert("Asia/Kolkata").dt.date == local_days[position]]
         if path.empty:
             continue
+        # Do not infer an outcome from spot bars after aligned futures data
+        # ends. A target or stop reached before the gap remains observable;
+        # otherwise this setup has no verifiable outcome.
+        missing_futures = np.flatnonzero(path.futures_close.isna().to_numpy())
+        path_incomplete = bool(len(missing_futures))
+        if len(missing_futures):
+            path = path.iloc[: int(missing_futures[0])]
+        if path.empty:
+            continue
         entry_price = float(path.iloc[0].open)
         risk = float(candidate["signal_atr"]) * contract.stop_atr
         reward = float(candidate["signal_atr"]) * contract.target_atr
@@ -338,6 +351,8 @@ def setup_candidates(
                 exit_timestamp = pd.Timestamp(future.timestamp)
                 break
         if ambiguous:
+            continue
+        if path_incomplete and exit_reason == "TIMEOUT":
             continue
         signed_return = (
             (exit_price - entry_price) / entry_price
@@ -377,17 +392,25 @@ def option_price_labels(
     provider: str,
     cost_model: str,
     slippage_pct: float = 0.05,
+    contract: SetupContract | None = None,
 ) -> tuple[pd.DataFrame, dict]:
-    """Replace proxy returns with verified ATM→ITM1 option-candle outcomes.
+    """Label rule signals using the option exit policy used by trading replay.
 
-    The underlying triple barrier still determines exit time. Option entry uses
-    the next option candle and option exit uses the candle aligned to the barrier
-    event. Bid/ask is preferred; otherwise OHLC receives two-sided slippage.
+    The first available option candle after the signal is the entry. Premium
+    stop, underlying stop/target and the 15:20 time exit are evaluated in that
+    order. Historical bid/ask is used when complete; otherwise OHLC prices
+    receive estimated two-sided slippage. A positive after-cost result is TAKE.
     """
     if dataset.empty:
-        return dataset.copy(), {"candidates": 0, "option_labelled": 0, "coverage": 0.0}
-    start = min(_naive_utc(value) for value in dataset.entry_timestamp)
-    end = max(_naive_utc(value) for value in dataset.exit_timestamp)
+        return dataset.copy(), {
+            "candidates": 0, "option_labelled": 0, "coverage": 0.0,
+            "rejections": {}, "missing_examples": [], "bid_ask_rows": 0,
+            "estimated_fill_rows": 0, "ambiguous_intrabar_rows": 0,
+        }
+    contract = contract or SetupContract()
+    required = {"timestamp", "underlying_code", "direction", "signal_close", "signal_atr"}
+    if missing := required - set(dataset.columns):
+        raise ValueError(f"Option replay needs signal fields: {', '.join(sorted(missing))}")
     codes = sorted(set(dataset.underlying_code))
     instruments = session.scalars(
         select(Instrument).where(
@@ -398,109 +421,212 @@ def option_price_labels(
             Instrument.lot_size > 0,
         )
     ).all()
-    instrument_by_key = {item.instrument_key: item for item in instruments}
-    candles = session.scalars(
-        select(Candle).where(
-            Candle.provider == provider,
-            Candle.underlying_code.in_(codes),
-            Candle.data_role == "OPTION",
-            Candle.timeframe == "5minute",
-            Candle.timestamp >= start,
-            Candle.timestamp <= end,
-            Candle.source_verified.is_(True),
-        )
-    ).all()
-    candle_by_key = {
-        (item.instrument_key, _naive_utc(item.timestamp)): item
-        for item in candles
-        if item.instrument_key in instrument_by_key
-    }
-    slip = Decimal(str(slippage_pct)) / Decimal("100")
+    contracts_by_side: dict[tuple[str, str], dict[date, list[Instrument]]] = defaultdict(lambda: defaultdict(list))
+    for instrument in instruments:
+        contracts_by_side[(instrument.underlying_code, instrument.option_type)][instrument.expiry].append(instrument)
+    expiries_by_side = {side: sorted(expiries) for side, expiries in contracts_by_side.items()}
     labelled: list[dict] = []
     rejection_counts: Counter = Counter()
     missing_examples: list[dict[str, str]] = []
-    for _, row in dataset.iterrows():
-        trading_day = pd.Timestamp(row.entry_timestamp).tz_convert("Asia/Kolkata").date()
-        chain = [
-            item
-            for item in instruments
-            if item.underlying_code == row.underlying_code
-            and item.option_type == row.direction
-            and item.expiry > trading_day
-            and item.valid_from <= trading_day
-            and (item.valid_to is None or item.valid_to >= trading_day)
-        ]
-        if not chain:
-            rejection_counts["NO_VERIFIED_CONTRACT"] += 1
-            if len(missing_examples) < 25:
-                missing_examples.append({"date": trading_day.isoformat(), "direction": str(row.direction), "reason": "NO_VERIFIED_CONTRACT", "entry_time": str(row.entry_timestamp)})
-            continue
-        expiry = min(item.expiry for item in chain)
-        chain = [item for item in chain if item.expiry == expiry]
-        strikes = sorted({item.strike for item in chain})
-        spot = Decimal(str(row.entry_price))
-        atm = min(strikes, key=lambda strike: abs(strike - spot))
-        position = strikes.index(atm)
-        itm = (
-            strikes[max(0, position - 1)]
-            if row.direction == "CE"
-            else strikes[min(len(strikes) - 1, position + 1)]
-        )
-        selected = None
-        for strike, moneyness in dict.fromkeys(((atm, "ATM"), (itm, "ITM1"))):
-            instrument = next(item for item in chain if item.strike == strike)
-            entry_bar = candle_by_key.get((instrument.instrument_key, _naive_utc(row.entry_timestamp)))
-            exit_bar = candle_by_key.get((instrument.instrument_key, _naive_utc(row.exit_timestamp)))
-            if entry_bar is not None and exit_bar is not None:
-                selected = instrument, moneyness, entry_bar, exit_bar
-                break
-        if selected is None:
-            rejection_counts["OPTION_ENTRY_OR_EXIT_BAR_MISSING"] += 1
-            if len(missing_examples) < 25:
-                missing_examples.append({"date": trading_day.isoformat(), "direction": str(row.direction), "reason": "OPTION_ENTRY_OR_EXIT_BAR_MISSING", "expiry": expiry.isoformat(), "atm": str(atm), "itm1": str(itm), "entry_time": str(row.entry_timestamp), "exit_time": str(row.exit_timestamp)})
-            continue
-        instrument, moneyness, entry_bar, exit_bar = selected
-        has_bid_ask = (
-            entry_bar.ask is not None
-            and entry_bar.bid is not None
-            and exit_bar.bid is not None
-            and Decimal(entry_bar.ask) > 0
-            and Decimal(entry_bar.bid) > 0
-            and Decimal(exit_bar.bid) > 0
-        )
-        entry_base = Decimal(entry_bar.ask) if has_bid_ask else Decimal(entry_bar.open)
-        exit_base = Decimal(exit_bar.bid) if has_bid_ask else Decimal(exit_bar.close)
-        option_entry = entry_base * (Decimal("1") + slip)
-        option_exit = exit_base * (Decimal("1") - slip)
-        gross = (option_exit - option_entry) * instrument.lot_size
-        charges = option_charges(
-            option_entry,
-            option_exit,
-            instrument.lot_size,
-            cost_model,
-            trading_day,
-            instrument.exchange,
-        )
-        net = gross - charges
-        notional = option_entry * instrument.lot_size
-        result = row.to_dict()
-        result.update(
-            {
-                "option_instrument_key": instrument.instrument_key,
-                "option_moneyness": moneyness,
-                "option_expiry": instrument.expiry,
-                "option_entry": float(option_entry),
-                "option_exit": float(option_exit),
-                "option_gross_pnl": float(gross),
-                "option_charges": float(charges),
-                "option_net_pnl": float(net),
-                "option_bid_ask_available": has_bid_ask,
-                "net_return": float(net / notional) if notional else 0.0,
-                "label": "TAKE" if row.exit_reason == "TARGET" and net > 0 else "SKIP",
-                "label_source": "VERIFIED_OPTION_CANDLES",
-            }
-        )
-        labelled.append(result)
+    square_off = time(15, 20)
+    base_slippage = Decimal(str(slippage_pct))
+    local_days = pd.to_datetime(dataset.timestamp, utc=True).dt.tz_convert("Asia/Kolkata").dt.date
+    for trading_day, day_setups in dataset.groupby(local_days, sort=True):
+        start_stamp = datetime.combine(trading_day, time.min, tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(UTC).replace(tzinfo=None)
+        cutoff = datetime.combine(trading_day, square_off, tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(UTC).replace(tzinfo=None)
+        plans = []
+        keys: set[str] = set()
+        for _, row in day_setups.iterrows():
+            signal_stamp = _naive_utc(row.timestamp)
+            reason = None
+            choices = []
+            if signal_stamp >= cutoff:
+                reason = "AFTER_SQUARE_OFF"
+            else:
+                side = (str(row.underlying_code), str(row.direction))
+                for expiry in expiries_by_side.get(side, ()):
+                    if expiry <= trading_day:
+                        continue
+                    chain = [
+                        item for item in contracts_by_side[side][expiry]
+                        if item.valid_from <= trading_day
+                        and (item.valid_to is None or item.valid_to >= trading_day)
+                    ]
+                    if chain:
+                        break
+                else:
+                    chain = []
+                if not chain:
+                    reason = "NO_VERIFIED_CONTRACT"
+                else:
+                    spot = Decimal(str(row.signal_close))
+                    selected_strikes = atm_itm1_strikes(
+                        str(row.underlying_code), spot, str(row.direction),
+                        [item.strike for item in chain],
+                    )
+                    if selected_strikes is None:
+                        reason = "NO_NEAR_ATM_CONTRACT"
+                    else:
+                        atm, itm = selected_strikes
+                        strikes_to_try = [(atm, "ATM")]
+                        if itm is not None:
+                            strikes_to_try.append((itm, "ITM1"))
+                        choices = [
+                            (next(item for item in chain if item.strike == strike), moneyness)
+                            for strike, moneyness in strikes_to_try
+                        ]
+                        keys.update(item.instrument_key for item, _ in choices)
+            plans.append((row, signal_stamp, choices, reason))
+
+        spot_bars = session.scalars(
+            select(Candle).where(
+                Candle.provider == provider, Candle.underlying_code.in_(codes),
+                Candle.data_role == "SPOT", Candle.timeframe == "5minute",
+                Candle.timestamp >= start_stamp, Candle.timestamp <= cutoff,
+                Candle.source_verified.is_(True),
+            )
+        ).all()
+        spot_by_time = {
+            (bar.underlying_code, _naive_utc(bar.timestamp)): bar for bar in spot_bars
+        }
+        bars_by_key: dict[str, list[Candle]] = defaultdict(list)
+        if keys:
+            option_bars = session.scalars(
+                select(Candle).where(
+                    Candle.provider == provider, Candle.instrument_key.in_(keys),
+                    Candle.data_role == "OPTION", Candle.timeframe == "5minute",
+                    Candle.timestamp >= start_stamp, Candle.timestamp <= cutoff,
+                    Candle.source_verified.is_(True),
+                ).order_by(Candle.instrument_key, Candle.timestamp)
+            ).all()
+            for bar in option_bars:
+                bars_by_key[bar.instrument_key].append(bar)
+
+        for row, signal_stamp, choices, reason in plans:
+            result = None
+            attempted_reasons = []
+            if reason is None:
+                for instrument, moneyness in choices:
+                    bars = [bar for bar in bars_by_key[instrument.instrument_key] if _naive_utc(bar.timestamp) > signal_stamp]
+                    if len(bars) < contract.entry_delay_bars:
+                        attempted_reasons.append("OPTION_ENTRY_BAR_MISSING")
+                        continue
+                    bars = bars[contract.entry_delay_bars - 1 :]
+                    entry_bar = bars[0]
+                    if entry_bar.volume < 1:
+                        attempted_reasons.append("VOLUME_BELOW_MINIMUM")
+                        continue
+                    if any(bar.open_interest > 0 for bar in bars) and entry_bar.open_interest <= 0:
+                        attempted_reasons.append("OPEN_INTEREST_UNAVAILABLE_AT_ENTRY")
+                        continue
+                    if (str(row.underlying_code), _naive_utc(entry_bar.timestamp)) not in spot_by_time:
+                        attempted_reasons.append("SPOT_ENTRY_BAR_MISSING")
+                        continue
+                    has_bid_ask = (
+                        entry_bar.ask is not None and entry_bar.bid is not None
+                        and all(bar.bid is not None for bar in bars)
+                    )
+                    if has_bid_ask:
+                        bid, ask = Decimal(entry_bar.bid), Decimal(entry_bar.ask)
+                        if bid <= 0 or ask < bid:
+                            attempted_reasons.append("INVALID_HISTORICAL_BID_ASK")
+                            continue
+                        midpoint = (ask + bid) / 2
+                        if (ask - bid) / midpoint * 100 > Decimal("1.5"):
+                            attempted_reasons.append("SPREAD_ABOVE_MAXIMUM")
+                            continue
+                    entry_base = Decimal(entry_bar.ask) if has_bid_ask else Decimal(entry_bar.open)
+                    if entry_base <= 0:
+                        attempted_reasons.append("INVALID_OPTION_PRICE")
+                        continue
+                    multiplier = Decimal("1")
+                    if entry_bar.volume < 5:
+                        multiplier += Decimal(5 - entry_bar.volume) / Decimal(5)
+                    effective_slippage = min(base_slippage * multiplier, base_slippage * 3)
+                    slip = effective_slippage / 100
+                    option_entry = entry_base * (1 + slip)
+                    premium_stop = option_entry * Decimal("0.75")
+                    spot_entry = Decimal(str(row.signal_close))
+                    risk = Decimal(str(row.signal_atr))
+                    stop_distance = risk * Decimal(str(contract.stop_atr))
+                    target_distance = risk * Decimal(str(contract.target_atr))
+                    target = spot_entry + target_distance if row.direction == "CE" else spot_entry - target_distance
+                    stop = spot_entry - stop_distance if row.direction == "CE" else spot_entry + stop_distance
+                    exit_bar = bars[-1]
+                    exit_reason = "TIME_EXIT"
+                    exit_base = Decimal(exit_bar.bid) if has_bid_ask else Decimal(exit_bar.close)
+                    missing_spot = False
+                    ambiguous_intrabar = False
+                    for bar in bars[1:]:
+                        underlying = spot_by_time.get((str(row.underlying_code), _naive_utc(bar.timestamp)))
+                        if underlying is None:
+                            missing_spot = True
+                            break
+                        premium_hit = Decimal(bar.low) <= premium_stop
+                        stop_hit = Decimal(underlying.low) <= stop if row.direction == "CE" else Decimal(underlying.high) >= stop
+                        target_hit = Decimal(underlying.high) >= target if row.direction == "CE" else Decimal(underlying.low) <= target
+                        if premium_hit or stop_hit or target_hit:
+                            exit_bar = bar
+                            observed_exit = Decimal(bar.bid) if has_bid_ask else Decimal(bar.close)
+                            if premium_hit:
+                                exit_reason = "PREMIUM_STOP"
+                                exit_base = min(observed_exit, premium_stop)
+                            elif stop_hit:
+                                exit_reason = "UNDERLYING_STOP"
+                                exit_base = observed_exit
+                            else:
+                                exit_reason = "UNDERLYING_TARGET"
+                                exit_base = observed_exit
+                            ambiguous_intrabar = bool(stop_hit and target_hit)
+                            break
+                    if missing_spot:
+                        attempted_reasons.append("SPOT_EXIT_PATH_INCOMPLETE")
+                        continue
+                    if exit_reason == "TIME_EXIT" and cutoff - _naive_utc(exit_bar.timestamp) > timedelta(minutes=5):
+                        attempted_reasons.append("OPTION_TIME_EXIT_BAR_MISSING")
+                        continue
+                    option_exit = exit_base * (1 - slip)
+                    gross = (option_exit - option_entry) * instrument.lot_size
+                    charges = option_charges(option_entry, option_exit, instrument.lot_size, cost_model, trading_day, instrument.exchange)
+                    net = gross - charges
+                    notional = option_entry * instrument.lot_size
+                    result = row.to_dict()
+                    result.update({
+                        "entry_timestamp": pd.Timestamp(_naive_utc(entry_bar.timestamp), tz="UTC"),
+                        "exit_timestamp": pd.Timestamp(_naive_utc(exit_bar.timestamp), tz="UTC"),
+                        "exit_reason": exit_reason,
+                        "bars_held": bars.index(exit_bar) + 1,
+                        "option_instrument_key": instrument.instrument_key,
+                        "option_moneyness": moneyness,
+                        "option_expiry": instrument.expiry,
+                        "option_entry": float(option_entry),
+                        "option_exit": float(option_exit),
+                        "option_gross_pnl": float(gross),
+                        "option_charges": float(charges),
+                        "option_net_pnl": float(net),
+                        "option_bid_ask_available": has_bid_ask,
+                        "option_fill_estimated": not has_bid_ask,
+                        "ambiguous_intrabar": ambiguous_intrabar,
+                        "net_return": float(net / notional) if notional else 0.0,
+                        "label": "TAKE" if net > 0 else "SKIP",
+                        "label_source": "VERIFIED_OPTION_CANDLES",
+                    })
+                    break
+                if result is None:
+                    reason = attempted_reasons[0] if attempted_reasons else "OPTION_ENTRY_BAR_MISSING"
+            if result is None:
+                rejection_counts[reason] += 1
+                if len(missing_examples) < 25:
+                    missing_examples.append({
+                        "date": trading_day.isoformat(), "direction": str(row.direction),
+                        "reason": reason, "signal_time": str(row.timestamp),
+                        "attempts": ", ".join(attempted_reasons),
+                        "expiry": choices[0][0].expiry.isoformat() if choices else None,
+                        "atm": str(choices[0][0].strike) if choices else None,
+                        "itm1": str(choices[1][0].strike) if len(choices) > 1 else None,
+                    })
+            else:
+                labelled.append(result)
     result_frame = pd.DataFrame(labelled)
     return result_frame, {
         "candidates": len(dataset),
@@ -509,6 +635,8 @@ def option_price_labels(
         "rejections": dict(rejection_counts),
         "missing_examples": missing_examples,
         "bid_ask_rows": int(result_frame.option_bid_ask_available.sum()) if not result_frame.empty else 0,
+        "estimated_fill_rows": int(result_frame.option_fill_estimated.sum()) if not result_frame.empty else 0,
+        "ambiguous_intrabar_rows": int(result_frame.ambiguous_intrabar.sum()) if not result_frame.empty else 0,
     }
 
 
@@ -818,6 +946,14 @@ def inspect_setup_training_data(
         "Tune": (fit_end + timedelta(days=1), tuning_end),
         "Holdout": (tuning_end + timedelta(days=1), holdout_end),
     }
+    uncounted_periods = [
+        {
+            "name": name, "start": start, "end": end,
+            "candidates": None, "labelled": 0,
+            "coverage_pct": None, "ready": False,
+        }
+        for name, (start, end) in periods.items()
+    ]
     try:
         with Session(engine) as session:
             start_stamp = datetime.combine(fit_start, time.min, tzinfo=UTC)
@@ -839,9 +975,22 @@ def inspect_setup_training_data(
                 )
             }
             option_indices = [code for code in indices if stored_counts.get((code, "OPTION"), 0)]
+            verified_metadata_indices = set(session.scalars(
+                select(Instrument.underlying_code).where(
+                    Instrument.provider == provider,
+                    Instrument.underlying_code.in_(option_indices),
+                    Instrument.instrument_kind == "OPTION",
+                    Instrument.metadata_verified.is_(True),
+                    Instrument.lot_size > 0,
+                    Instrument.valid_from <= holdout_end,
+                    Instrument.expiry > fit_start,
+                    (Instrument.valid_to.is_(None) | (Instrument.valid_to >= fit_start)),
+                ).distinct()
+            ).all()) if option_indices else set()
+            scan_indices = [code for code in option_indices if code in verified_metadata_indices]
             frames, candle_counts = (
-                _load_setup_frames(session, option_indices, fit_start, holdout_end, provider)
-                if option_indices else ({}, {})
+                _load_setup_frames(session, scan_indices, fit_start, holdout_end, provider)
+                if scan_indices else ({}, {})
             )
             for code in indices:
                 stored_spot = stored_counts.get((code, "SPOT"), 0)
@@ -863,14 +1012,19 @@ def inspect_setup_training_data(
                             "Rule setups were not counted because option outcomes cannot be checked."
                         )
                     )
-                    summary["periods"] = [
-                        {
-                            "name": name, "start": start, "end": end,
-                            "candidates": None, "labelled": 0,
-                            "coverage_pct": None, "ready": False,
-                        }
-                        for name, (start, end) in periods.items()
-                    ]
+                    summary["periods"] = uncounted_periods
+                    results.append(summary)
+                    continue
+                if code not in verified_metadata_indices:
+                    summary["issue"] = (
+                        "Fewer than 100 verified spot or futures candles"
+                        if summary["spot_candles"] < 100 or summary["futures_candles"] < 100
+                        else (
+                            "No verified historical option lot-size metadata covers these dates. "
+                            "Import verified contract metadata before checking option outcomes."
+                        )
+                    )
+                    summary["periods"] = uncounted_periods
                     results.append(summary)
                     continue
                 if code not in frames:
@@ -879,12 +1033,12 @@ def inspect_setup_training_data(
                     continue
                 spot_frame, futures_frame = frames[code]
                 reference = frames.get(relative_index_code(code))
-                dataset = setup_candidates(
+                dataset = setup_rule_candidates(
                     spot_frame, futures_frame, code,
                     relative_frame=reference[0] if reference else None,
                 )
                 if dataset.empty:
-                    summary["issue"] = "No completed rule candidates in this period"
+                    summary["issue"] = "No rule candidates in this period"
                     results.append(summary)
                     continue
                 labelled, details = option_price_labels(
@@ -892,6 +1046,9 @@ def inspect_setup_training_data(
                 )
                 summary["rejections"] = details["rejections"]
                 summary["missing_examples"] = details["missing_examples"]
+                summary["bid_ask_rows"] = details["bid_ask_rows"]
+                summary["estimated_fill_rows"] = details["estimated_fill_rows"]
+                summary["ambiguous_intrabar_rows"] = details["ambiguous_intrabar_rows"]
                 candidate_days = pd.to_datetime(dataset.timestamp, utc=True).dt.tz_convert("Asia/Kolkata").dt.date
                 labelled_days = (
                     pd.to_datetime(labelled.timestamp, utc=True).dt.tz_convert("Asia/Kolkata").dt.date
@@ -955,15 +1112,14 @@ def train_setup_quality_models(
         spot_frame, futures_frame = frames[code]
         relative_code = relative_index_code(code)
         relative_frame = frames.get(relative_code, (None, None))[0]
-        dataset = setup_candidates(
+        dataset = setup_rule_candidates(
             spot_frame,
             futures_frame,
             code,
             relative_frame=relative_frame,
-            contract=contract,
         )
         if dataset.empty:
-            raise RuntimeError(f"{code}: no rule-confirmed candidates could be labelled")
+            raise RuntimeError(f"{code}: no rule-confirmed candidates were found")
         datasets[code] = dataset.sort_values("timestamp").reset_index(drop=True)
         coverage[code]["candidates"] = len(dataset)
 
@@ -974,19 +1130,23 @@ def train_setup_quality_models(
     label_sources: dict[str, str] = {}
     try:
         with Session(label_engine) as session:
-            for code, proxy_dataset in list(datasets.items()):
+            for code, rule_dataset in list(datasets.items()):
                 option_dataset, option_coverage = option_price_labels(
                     session,
-                    proxy_dataset,
+                    rule_dataset,
                     provider=provider,
                     cost_model=provider,
+                    contract=contract,
                 )
                 coverage[code]["option_labelled_candidates"] = option_coverage["option_labelled"]
                 coverage[code]["option_label_coverage_pct"] = round(
                     float(option_coverage["coverage"]) * 100, 2
                 )
                 coverage[code]["option_label_rejections"] = option_coverage["rejections"]
-                proxy_dates = pd.to_datetime(proxy_dataset.timestamp, utc=True).dt.tz_convert("Asia/Kolkata").dt.date
+                coverage[code]["estimated_fill_rows"] = option_coverage["estimated_fill_rows"]
+                coverage[code]["bid_ask_rows"] = option_coverage["bid_ask_rows"]
+                coverage[code]["ambiguous_intrabar_rows"] = option_coverage["ambiguous_intrabar_rows"]
+                rule_dates = pd.to_datetime(rule_dataset.timestamp, utc=True).dt.tz_convert("Asia/Kolkata").dt.date
                 option_dates = (
                     pd.to_datetime(option_dataset.timestamp, utc=True).dt.tz_convert("Asia/Kolkata").dt.date
                     if not option_dataset.empty
@@ -999,14 +1159,24 @@ def train_setup_quality_models(
                 }
                 period_coverage = {}
                 for name, (period_start, period_end) in periods.items():
-                    proxy_count = int(((proxy_dates >= period_start) & (proxy_dates <= period_end)).sum())
+                    rule_count = int(((rule_dates >= period_start) & (rule_dates <= period_end)).sum())
                     option_count = int(((option_dates >= period_start) & (option_dates <= period_end)).sum()) if len(option_dates) else 0
-                    period_coverage[name] = round(option_count / proxy_count, 4) if proxy_count else 0.0
+                    period_coverage[name] = round(option_count / rule_count, 4) if rule_count else 0.0
                 coverage[code]["option_label_period_coverage"] = period_coverage
                 if period_coverage and min(period_coverage.values()) >= 0.90:
                     datasets[code] = option_dataset.sort_values("timestamp").reset_index(drop=True)
                     label_sources[code] = "VERIFIED_OPTION_CANDLES"
                 else:
+                    spot_frame, futures_frame = frames[code]
+                    reference = frames.get(relative_index_code(code))
+                    proxy_dataset = setup_candidates(
+                        spot_frame, futures_frame, code,
+                        relative_frame=reference[0] if reference else None,
+                        contract=contract,
+                    )
+                    if proxy_dataset.empty:
+                        raise RuntimeError(f"{code}: option labels are incomplete and no proxy labels are available")
+                    datasets[code] = proxy_dataset.sort_values("timestamp").reset_index(drop=True)
                     label_sources[code] = "UNDERLYING_TRIPLE_BARRIER_PROXY"
     finally:
         label_engine.dispose()
@@ -1172,6 +1342,18 @@ def train_setup_quality_models(
         "classes": ["SKIP", "TAKE"],
         "label_source": overall_label_source,
         "label_sources_by_index": label_sources,
+        "label_definition": "TAKE when replayed option net P&L after costs is positive; otherwise SKIP",
+        "option_replay_policy": {
+            "expiry_day_trading": False,
+            "contract_order": ["ATM", "ITM1"],
+            "stop_atr": contract.stop_atr,
+            "target_atr": contract.target_atr,
+            "premium_emergency_stop_pct": 25,
+            "square_off_time_ist": "15:20",
+            "slippage_pct_base": 0.05,
+            "fill_fallback": "option OHLC with estimated two-sided slippage when bid/ask is unavailable",
+            "intrabar_conflict": "stop first when one-minute data is unavailable",
+        },
         "training_contract": asdict(contract),
         "coverage": coverage,
         "index_models": index_models,
@@ -1194,6 +1376,7 @@ def train_setup_quality_models(
         "tuning_end": tuning_end.isoformat(),
         "validation_end": holdout_end.isoformat(),
         "label_source": overall_label_source,
+        "label_definition": "option_net_pnl_after_costs_positive",
         "index_models": {
             code: {
                 "file": detail["file"],

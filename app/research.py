@@ -11,6 +11,7 @@ from sqlalchemy import select
 from .data_quality import _missing_timestamps
 from .domain import Contract
 from .models import Candle, Instrument
+from .option_selector import atm_itm1_strikes, expected_atm_strike
 from .providers import BrokerClient, provider_name
 
 
@@ -155,6 +156,7 @@ async def _store_candles(
     minutes: int = 5,
     repair_only: bool = False,
     repair_dates: set[date] | None = None,
+    required_dates: set[date] | None = None,
     warnings: list[str] | None = None,
 ) -> int:
     inserted = 0
@@ -175,18 +177,17 @@ async def _store_candles(
                 .order_by(Candle.timestamp)
             ).all()
         if stored:
-            gap_days = sorted(
-                day
-                for day in (
-                    repair_dates
-                    if repair_dates is not None
-                    else {
-                        stamp.astimezone(ZoneInfo("Asia/Kolkata")).date()
-                        for stamp in _missing_timestamps(list(stored), minutes)
-                    }
-                )
-                if start <= day <= end
-            )
+            def trading_day(stamp: datetime) -> date:
+                utc_stamp = stamp.replace(tzinfo=UTC) if stamp.tzinfo is None else stamp.astimezone(UTC)
+                return utc_stamp.astimezone(ZoneInfo("Asia/Kolkata")).date()
+
+            gap_days = set(repair_dates or ())
+            if repair_dates is None:
+                gap_days.update(trading_day(stamp) for stamp in _missing_timestamps(list(stored), minutes))
+            if required_dates:
+                stored_days = {trading_day(stamp) for stamp in stored}
+                gap_days.update(required_dates - stored_days)
+            gap_days = sorted(day for day in gap_days if start <= day <= end)
             ranges = [(day, day) for day in gap_days]
     for chunk_start, chunk_end in ranges:
         rows = (
@@ -302,13 +303,18 @@ def _contract_choices(contracts: list[Contract], spot: Decimal) -> list[Contract
     selected: list[Contract] = []
     for option_type in ("CE", "PE"):
         side = [item for item in contracts if item.option_type == option_type]
-        strikes = sorted({item.strike for item in side})
-        if not strikes:
+        if not side:
             continue
-        atm = min(strikes, key=lambda strike: abs(strike - spot))
-        position = strikes.index(atm)
-        itm = strikes[max(0, position - 1)] if option_type == "CE" else strikes[min(len(strikes) - 1, position + 1)]
-        selected.extend(item for item in side if item.strike in {atm, itm})
+        selected_strikes = atm_itm1_strikes(
+            side[0].underlying_code, spot, option_type, [item.strike for item in side]
+        )
+        if selected_strikes is None:
+            continue
+        atm, itm = selected_strikes
+        wanted = {atm}
+        if itm is not None:
+            wanted.add(itm)
+        selected.extend(item for item in side if item.strike in wanted)
     return selected
 
 
@@ -525,12 +531,15 @@ async def sync_research_data(
         contracts_by_expiry: dict[date, list[Contract]] = {}
         selected: dict[str, Contract] = {}
         first_selected_day: dict[str, date] = {}
-        daily_spot: dict[date, Decimal] = {}
+        selected_days: dict[str, set[date]] = {}
+        daily_spots: dict[date, set[Decimal]] = {}
         for row in underlying_rows:
             stamp = row.timestamp.replace(tzinfo=UTC) if row.timestamp.tzinfo is None else row.timestamp.astimezone(UTC)
-            daily_spot[stamp.astimezone(ZoneInfo("Asia/Kolkata")).date()] = row.close
+            atm = expected_atm_strike(code, row.close)
+            if atm is not None:
+                daily_spots.setdefault(stamp.astimezone(ZoneInfo("Asia/Kolkata")).date(), set()).add(atm)
 
-        for trading_day, spot in daily_spot.items():
+        for trading_day, intraday_atm_strikes in daily_spots.items():
             eligible = [expiry for expiry in expiries if expiry > trading_day]
             if not eligible:
                 continue
@@ -542,9 +551,11 @@ async def sync_research_data(
                         f"{code}: discovering option contracts for {expiry}",
                     )
                 contracts_by_expiry[expiry] = await client.historical_contracts(code, expiry)
-            for contract in _contract_choices(contracts_by_expiry[expiry], spot):
-                selected[contract.instrument_key] = contract
-                first_selected_day.setdefault(contract.instrument_key, trading_day)
+            for atm in intraday_atm_strikes:
+                for contract in _contract_choices(contracts_by_expiry[expiry], atm):
+                    selected[contract.instrument_key] = contract
+                    first_selected_day.setdefault(contract.instrument_key, trading_day)
+                    selected_days.setdefault(contract.instrument_key, set()).add(trading_day)
 
         if not selected:
             warning = f"{code}: no historical ATM/ITM1 contracts were resolved from {provider}"
@@ -576,6 +587,7 @@ async def sync_research_data(
                 contract=contract,
                 data_role="OPTION",
                 repair_only=repair_only,
+                required_dates=selected_days[contract.instrument_key],
                 warnings=warnings,
             )
             option_count += count

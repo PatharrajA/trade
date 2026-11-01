@@ -8,7 +8,7 @@ from app.models import Candle, Instrument
 def test_metrics_are_chronological_and_after_costs():
     rows = [
         {"exit_time": datetime(2025, 2, 1, tzinfo=UTC), "underlying_code": "NIFTY", "option_type": "PE", "moneyness": "ITM1", "net_pnl": Decimal("-500")},
-        {"exit_time": datetime(2025, 1, 1, tzinfo=UTC), "underlying_code": "NIFTY", "option_type": "CE", "moneyness": "ATM", "net_pnl": Decimal("1000")},
+        {"exit_time": datetime(2025, 1, 1), "underlying_code": "NIFTY", "option_type": "CE", "moneyness": "ATM", "net_pnl": Decimal("1000")},
     ]
     result = metrics(rows, Decimal("100000"))
     assert result["net_pnl"] == 500.0

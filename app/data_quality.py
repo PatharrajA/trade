@@ -23,6 +23,20 @@ def option_replay_issue(session: Session, provider: str, code: str, start: date,
     )
     if session.scalar(select(Candle.id).where(*period).limit(1)) is None:
         return f"{code}: no verified option candles in {start} to {end}"
+    has_dated_metadata = session.scalar(
+        select(Instrument.id).where(
+            Instrument.provider == provider,
+            Instrument.underlying_code == code,
+            Instrument.instrument_kind == "OPTION",
+            Instrument.metadata_verified.is_(True),
+            Instrument.lot_size > 0,
+            Instrument.valid_from <= end,
+            (Instrument.valid_to.is_(None) | (Instrument.valid_to >= start)),
+            Instrument.expiry > start,
+        ).limit(1)
+    )
+    if has_dated_metadata is None:
+        return f"{code}: option candles have no matching verified historical lot-size metadata"
     matching = session.scalar(
         select(Candle.id)
         .join(Instrument, and_(

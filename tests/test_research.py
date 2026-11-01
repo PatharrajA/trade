@@ -76,8 +76,9 @@ async def test_option_download_starts_when_contract_first_selected(tmp_path):
 
         async def historical_candles(self, _key, _start, _end, _minutes):
             return [
-                ["2025-01-01T09:15:00", 100, 101, 99, 100, 0],
-                ["2025-01-10T09:15:00", 110, 111, 109, 110, 0],
+                ["2025-01-01T09:15:00", 25000, 25001, 24999, 25000, 0],
+                ["2025-01-10T09:15:00", 25050, 25051, 25049, 25050, 0],
+                ["2025-01-10T15:20:00", 25200, 25201, 25199, 25200, 0],
             ]
 
         async def historical_expiries(self, _code, _start, _end):
@@ -94,7 +95,7 @@ async def test_option_download_starts_when_contract_first_selected(tmp_path):
                     strike=Decimal(strike), option_type="CE", lot_size=50,
                     tick_size=Decimal("0.05"), provider="GROWW",
                 )
-                for strike in (100, 110, 120)
+                for strike in (24950, 25000, 25050, 25100, 25150, 25200)
             ]
 
         async def historical_option_candles(self, contract, start, end, minutes):
@@ -112,7 +113,8 @@ async def test_option_download_starts_when_contract_first_selected(tmp_path):
         include_options=True, progress=progress,
     )
 
-    assert ("CE-110", date(2025, 1, 10), date(2025, 1, 10), 5) in client.option_calls
+    assert ("CE-25050", date(2025, 1, 10), date(2025, 1, 10), 5) in client.option_calls
+    assert ("CE-25200", date(2025, 1, 10), date(2025, 1, 10), 5) in client.option_calls
     assert any("downloading option contracts" in message for _, _, message in updates)
     engine.dispose()
 
@@ -154,6 +156,48 @@ async def test_repair_only_requests_detected_intraday_gap(tmp_path):
     assert client.calls == [(trading_day, trading_day, 5)]
     with factory() as session:
         assert session.scalar(select(func.count()).select_from(Candle)) == 3
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_repair_downloads_selected_day_with_no_stored_option_bars(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'missing-option-day.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    with factory() as session:
+        session.add(Candle(
+            provider="GROWW", instrument_key="NIFTY-OPTION",
+            underlying_code="NIFTY", timeframe="5minute",
+            timestamp=datetime(2025, 11, 21, 3, 45, tzinfo=UTC),
+            open=100, high=101, low=99, close=100,
+            source_verified=True, data_role="OPTION",
+        ))
+        session.commit()
+
+    class MissingDayClient:
+        def __init__(self):
+            self.calls = []
+
+        async def historical_option_candles(self, _contract, start, end, _minutes):
+            self.calls.append((start, end))
+            return [["2025-11-24T09:15:00", 100, 101, 99, 100, 10, 10]]
+
+    contract = Contract(
+        instrument_key="NIFTY-OPTION", trading_symbol="NIFTY OPTION",
+        exchange="NSE", underlying_code="NIFTY", expiry=date(2025, 11, 25),
+        strike=Decimal("25000"), option_type="CE", lot_size=65,
+        tick_size=Decimal("0.05"), provider="GROWW",
+    )
+    client = MissingDayClient()
+    inserted = await _store_candles(
+        client, factory, contract.instrument_key, "NIFTY",
+        date(2025, 11, 21), date(2025, 11, 24), provider="GROWW",
+        contract=contract, data_role="OPTION", repair_only=True,
+        required_dates={date(2025, 11, 21), date(2025, 11, 24)},
+    )
+
+    assert client.calls == [(date(2025, 11, 24), date(2025, 11, 24))]
+    assert inserted == 1
     engine.dispose()
 
 

@@ -39,6 +39,25 @@ def test_historical_contract_selection_is_provider_scoped(session):
     assert choices[0][0].lot_size == 50
 
 
+def test_historical_contract_rejects_distant_sensex_strike(session):
+    trading_day = date(2026, 2, 20)
+    session.add(Instrument(
+        provider="GROWW", instrument_key="BSE-SENSEX-26Feb26-91100-CE",
+        underlying_code="SENSEX", exchange="BSE", trading_symbol="SENSEX CE",
+        option_type="CE", strike=Decimal("91100"), expiry=date(2026, 2, 26),
+        lot_size=20, tick_size=Decimal("0.05"), valid_from=trading_day,
+        valid_to=date(2026, 2, 26), active=False,
+    ))
+    session.commit()
+
+    reasons = []
+    assert _historical_contract(
+        session, "GROWW", "SENSEX", "CE", trading_day, Decimal("83000"),
+        rejection_reasons=reasons,
+    ) == []
+    assert reasons == ["NO_NEAR_ATM_CONTRACT"]
+
+
 def test_same_external_key_can_be_stored_for_two_providers(session):
     stamp = datetime(2026, 9, 1, 3, 45, tzinfo=UTC)
     for provider in ("UPSTOX", "GROWW"):
