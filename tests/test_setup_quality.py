@@ -441,3 +441,6 @@ def test_option_labels_reject_sparse_chain_instead_of_calling_it_atm(session):
 
     assert labelled.empty
     assert coverage["rejections"] == {"NO_NEAR_ATM_CONTRACT": 1}
+    assert coverage["missing_examples"][0]["expiry"] == "2026-02-26"
+    assert coverage["missing_examples"][0]["atm"] == "83000.00"
+    assert coverage["missing_examples"][0]["itm1"] == "82900.00"

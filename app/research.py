@@ -11,9 +11,13 @@ from sqlalchemy import select
 from .data_quality import _missing_timestamps
 from .domain import Contract
 from .groww import GrowwError
+from .historical_metadata import verify_historical_contract_metadata
 from .models import Candle, Instrument
 from .option_selector import atm_itm1_strikes, expected_atm_strike
 from .providers import BrokerClient, provider_name
+
+
+RETRYABLE_ARCHIVE_STATUSES = frozenset({500, 502, 503, 504})
 
 
 @dataclass(frozen=True)
@@ -394,8 +398,15 @@ async def sync_research_data(
     option_contract_count = 0
     warnings: list[str] = []
     incomplete_reasons: list[str] = []
+    failed_contract_counts: dict[str, int] = {}
     completed_steps = 0
     total_steps = len(indices) * (3 if include_options else 2)
+
+    if provider == "GROWW" and include_options:
+        # Existing contracts can be repaired even if a later broker request fails.
+        with session_factory() as session:
+            verify_historical_contract_metadata(session)
+            session.commit()
 
     for code in indices:
         underlying_count += await _store_candles(
@@ -443,6 +454,8 @@ async def sync_research_data(
             warnings.append(
                 f"{code}: historical futures discovery unavailable from {provider}: {exc}"
             )
+            if provider == "GROWW" and isinstance(exc, GrowwError) and exc.status_code in RETRYABLE_ARCHIVE_STATUSES:
+                failed_contract_counts[code] = failed_contract_counts.get(code, 0) + 1
             continue
         futures_found = False
         for expiry in _monthly_expiries(expiries):
@@ -450,25 +463,35 @@ async def sync_research_data(
                 contracts = await client.historical_future_contracts(code, expiry)
             except Exception as exc:
                 warnings.append(f"{code}: futures metadata unavailable for {expiry}: {exc}")
+                if provider == "GROWW" and isinstance(exc, GrowwError) and exc.status_code in RETRYABLE_ARCHIVE_STATUSES:
+                    failed_contract_counts[code] = failed_contract_counts.get(code, 0) + 1
                 continue
             for contract in contracts:
                 candle_end = min(end, contract.expiry)
                 if candle_end < start:
                     continue
-                futures_count += await _store_candles(
-                    client,
-                    session_factory,
-                    contract.instrument_key,
-                    code,
-                    start,
-                    candle_end,
-                    provider=provider,
-                    contract=contract,
-                    data_role="FUTURE",
-                    repair_only=repair_only,
-                    repair_dates=futures_repair_dates,
-                    warnings=warnings,
-                )
+                try:
+                    futures_count += await _store_candles(
+                        client,
+                        session_factory,
+                        contract.instrument_key,
+                        code,
+                        start,
+                        candle_end,
+                        provider=provider,
+                        contract=contract,
+                        data_role="FUTURE",
+                        repair_only=repair_only,
+                        repair_dates=futures_repair_dates,
+                        warnings=warnings,
+                    )
+                except GrowwError as exc:
+                    if provider != "GROWW" or exc.status_code not in RETRYABLE_ARCHIVE_STATUSES:
+                        raise
+                    failed_contract_counts[code] = failed_contract_counts.get(code, 0) + 1
+                    if len(warnings) < 20:
+                        warnings.append(f"{code}: futures {contract.instrument_key} failed after broker retries (HTTP {exc.status_code})")
+                    continue
                 with session_factory() as session:
                     first_candle = session.scalar(
                         select(Candle.timestamp)
@@ -486,7 +509,9 @@ async def sync_research_data(
                     futures_contract_count += int(
                         _store_contract_version(session_factory, contract, code, first_candle)
                     )
-        if not futures_found:
+        if not futures_found and not _has_candles(
+            session_factory, provider, code, "FUTURE", start, end
+        ):
             warnings.append(
                 f"{code}: no verified {provider} futures candles were stored; VWAP/volume training is unavailable"
             )
@@ -511,6 +536,10 @@ async def sync_research_data(
                     check_option_metadata=False,
                 )
             )
+        incomplete_reasons.extend(
+            f"{code}: {count} historical contracts could not be downloaded after broker retries"
+            for code, count in failed_contract_counts.items()
+        )
         return SyncResult(
             underlying_count,
             futures_count,
@@ -544,6 +573,8 @@ async def sync_research_data(
             expiries = await client.historical_expiries(code, start, expiry_end)
         except Exception as exc:
             warnings.append(f"{code}: historical option discovery unavailable from {provider}: {exc}")
+            if provider == "GROWW" and isinstance(exc, GrowwError) and exc.status_code in RETRYABLE_ARCHIVE_STATUSES:
+                failed_contract_counts[code] = failed_contract_counts.get(code, 0) + 1
             continue
         if not expiries:
             warnings.append(f"{code}: {provider} returned no historical expiries for this period")
@@ -570,7 +601,15 @@ async def sync_research_data(
                         completed_steps, total_steps,
                         f"{code}: discovering option contracts for {expiry}",
                     )
-                contracts_by_expiry[expiry] = await client.historical_contracts(code, expiry)
+                try:
+                    contracts_by_expiry[expiry] = await client.historical_contracts(code, expiry)
+                except GrowwError as exc:
+                    if provider != "GROWW" or exc.status_code not in RETRYABLE_ARCHIVE_STATUSES:
+                        raise
+                    contracts_by_expiry[expiry] = []
+                    failed_contract_counts[code] = failed_contract_counts.get(code, 0) + 1
+                    if len(warnings) < 20:
+                        warnings.append(f"{code}: option contracts for {expiry} could not be discovered (HTTP {exc.status_code})")
             for atm in intraday_atm_strikes:
                 for contract in _contract_choices(contracts_by_expiry[expiry], atm):
                     selected[contract.instrument_key] = contract
@@ -596,20 +635,28 @@ async def sync_research_data(
             contract_start = max(start, first_selected_day[contract.instrument_key])
             if candle_end < contract_start:
                 continue
-            count = await _store_candles(
-                client,
-                session_factory,
-                contract.instrument_key,
-                code,
-                contract_start,
-                candle_end,
-                provider=provider,
-                contract=contract,
-                data_role="OPTION",
-                repair_only=repair_only,
-                required_dates=selected_days[contract.instrument_key],
-                warnings=warnings,
-            )
+            try:
+                count = await _store_candles(
+                    client,
+                    session_factory,
+                    contract.instrument_key,
+                    code,
+                    contract_start,
+                    candle_end,
+                    provider=provider,
+                    contract=contract,
+                    data_role="OPTION",
+                    repair_only=repair_only,
+                    required_dates=selected_days[contract.instrument_key],
+                    warnings=warnings,
+                )
+            except GrowwError as exc:
+                if provider != "GROWW" or exc.status_code not in RETRYABLE_ARCHIVE_STATUSES:
+                    raise
+                failed_contract_counts[code] = failed_contract_counts.get(code, 0) + 1
+                if len(warnings) < 20:
+                    warnings.append(f"{code}: option {contract.instrument_key} failed after broker retries (HTTP {exc.status_code})")
+                continue
             option_count += count
             with session_factory() as session:
                 first_candle = session.scalar(
@@ -632,10 +679,17 @@ async def sync_research_data(
         if progress:
             await progress(completed_steps, total_steps, f"{code}: option history stored")
 
-    if option_count == 0:
+    if option_count == 0 and not any(
+        _has_candles(session_factory, provider, code, "OPTION", start, end)
+        for code in indices
+    ):
         warnings.append(
             f"No verified {provider} historical option candles were stored. The backtest will fail closed instead of manufacturing premiums."
         )
+    if provider == "GROWW":
+        with session_factory() as session:
+            verify_historical_contract_metadata(session)
+            session.commit()
     for code in indices:
         if not _has_candles(session_factory, provider, code, "FUTURE", start, end):
             incomplete_reasons.append(
@@ -656,6 +710,10 @@ async def sync_research_data(
                 check_option_metadata=True,
             )
         )
+    incomplete_reasons.extend(
+        f"{code}: {count} historical contracts could not be downloaded after broker retries"
+        for code, count in failed_contract_counts.items()
+    )
     return SyncResult(
         underlying_count,
         futures_count,

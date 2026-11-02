@@ -16,7 +16,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
 from .models import Candle, Instrument
-from .option_selector import atm_itm1_strikes
+from .option_selector import STRIKE_STEPS, atm_itm1_strikes, expected_atm_strike
 from .risk import option_charges
 from .strategy import with_futures_features
 from .training import front_future_frame, model_metadata_path
@@ -438,8 +438,16 @@ def option_price_labels(
         keys: set[str] = set()
         for _, row in day_setups.iterrows():
             signal_stamp = _naive_utc(row.timestamp)
+            spot = Decimal(str(row.signal_close))
+            expected_atm = expected_atm_strike(str(row.underlying_code), spot)
+            strike_step = STRIKE_STEPS.get(str(row.underlying_code))
+            expected_itm = (
+                expected_atm + (-strike_step if row.direction == "CE" else strike_step)
+                if expected_atm is not None and strike_step is not None else None
+            )
             reason = None
             choices = []
+            expiry_hint = None
             if signal_stamp >= cutoff:
                 reason = "AFTER_SQUARE_OFF"
             else:
@@ -459,7 +467,7 @@ def option_price_labels(
                 if not chain:
                     reason = "NO_VERIFIED_CONTRACT"
                 else:
-                    spot = Decimal(str(row.signal_close))
+                    expiry_hint = chain[0].expiry
                     selected_strikes = atm_itm1_strikes(
                         str(row.underlying_code), spot, str(row.direction),
                         [item.strike for item in chain],
@@ -476,7 +484,7 @@ def option_price_labels(
                             for strike, moneyness in strikes_to_try
                         ]
                         keys.update(item.instrument_key for item, _ in choices)
-            plans.append((row, signal_stamp, choices, reason))
+            plans.append((row, signal_stamp, choices, reason, expiry_hint, expected_atm, expected_itm))
 
         spot_bars = session.scalars(
             select(Candle).where(
@@ -502,7 +510,7 @@ def option_price_labels(
             for bar in option_bars:
                 bars_by_key[bar.instrument_key].append(bar)
 
-        for row, signal_stamp, choices, reason in plans:
+        for row, signal_stamp, choices, reason, expiry_hint, expected_atm, expected_itm in plans:
             result = None
             attempted_reasons = []
             if reason is None:
@@ -621,9 +629,11 @@ def option_price_labels(
                         "date": trading_day.isoformat(), "direction": str(row.direction),
                         "reason": reason, "signal_time": str(row.timestamp),
                         "attempts": ", ".join(attempted_reasons),
-                        "expiry": choices[0][0].expiry.isoformat() if choices else None,
-                        "atm": str(choices[0][0].strike) if choices else None,
-                        "itm1": str(choices[1][0].strike) if len(choices) > 1 else None,
+                        "expiry": choices[0][0].expiry.isoformat() if choices else (
+                            expiry_hint.isoformat() if expiry_hint else None
+                        ),
+                        "atm": f"{expected_atm:.2f}" if expected_atm is not None else None,
+                        "itm1": f"{expected_itm:.2f}" if expected_itm is not None else None,
                     })
             else:
                 labelled.append(result)

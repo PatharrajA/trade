@@ -57,6 +57,115 @@ def test_metadata_repair_warning_is_scoped_to_requested_dates(session):
 
 
 @pytest.mark.asyncio
+async def test_repair_resolves_stored_groww_metadata_without_new_candles(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'stored-metadata.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    trading_day = date(2024, 4, 25)
+    option_key = "NSE-NIFTY-02May24-22500-CE"
+    with factory() as session:
+        for role, key in (("SPOT", "NSE-NIFTY"), ("FUTURE", "NSE-NIFTY-FUT"), ("OPTION", option_key)):
+            session.add(Candle(
+                provider="GROWW", instrument_key=key, underlying_code="NIFTY",
+                data_role=role, timeframe="5minute",
+                timestamp=datetime(2024, 4, 25, 3, 45, tzinfo=UTC),
+                open=22500, high=22505, low=22495, close=22500,
+                source_verified=True,
+            ))
+        session.add(Instrument(
+            provider="GROWW", instrument_key=option_key,
+            underlying_code="NIFTY", exchange="NSE", trading_symbol=option_key,
+            option_type="CE", strike=Decimal("22500"), expiry=date(2024, 5, 2),
+            lot_size=0, tick_size=Decimal("0.05"), valid_from=trading_day,
+            valid_to=date(2024, 5, 2), instrument_kind="OPTION",
+            metadata_verified=False, metadata_source="GROWW_HISTORICAL_SYMBOL",
+        ))
+        session.commit()
+
+    class ExistingDataClient:
+        provider = "GROWW"
+
+        @staticmethod
+        def index_key(_code):
+            return "NSE-NIFTY"
+
+        async def historical_candles(self, *_args):
+            raise AssertionError("No new candle request is needed")
+
+        async def historical_expiries(self, *_args):
+            return []
+
+    result = await sync_research_data(
+        ExistingDataClient(), factory, ["NIFTY"], trading_day, trading_day,
+        include_options=True, repair_only=True,
+    )
+
+    assert result.option_candles == 0
+    assert result.incomplete_reasons == []
+    assert not any("no verified GROWW futures candles" in warning for warning in result.warnings)
+    assert not any("No verified GROWW historical option candles" in warning for warning in result.warnings)
+    with factory() as session:
+        option = session.scalar(select(Instrument).where(Instrument.instrument_key == option_key))
+        assert option.metadata_verified is True
+        assert option.lot_size == 50
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_one_groww_option_timeout_does_not_stop_other_contracts(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'option-timeout.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    trading_day = date(2025, 1, 29)
+    expiry = date(2025, 1, 30)
+
+    class PartialArchiveClient:
+        provider = "GROWW"
+
+        @staticmethod
+        def index_key(_code):
+            return "NSE-NIFTY"
+
+        async def historical_candles(self, *_args):
+            return [["2025-01-29T09:15:00", 25000, 25001, 24999, 25000, 0, 0]]
+
+        async def historical_expiries(self, *_args):
+            return [expiry]
+
+        async def historical_future_contracts(self, *_args):
+            return []
+
+        async def historical_contracts(self, *_args):
+            return [
+                Contract(
+                    instrument_key=f"NSE-NIFTY-30Jan25-25000-{side}",
+                    trading_symbol=f"NSE-NIFTY-30Jan25-25000-{side}",
+                    exchange="NSE", underlying_code="NIFTY", expiry=expiry,
+                    strike=Decimal("25000"), option_type=side, lot_size=25,
+                    tick_size=Decimal("0.05"), provider="GROWW",
+                )
+                for side in ("CE", "PE")
+            ]
+
+        async def historical_option_candles(self, contract, *_args):
+            if contract.option_type == "CE":
+                raise GrowwError("timeout executing GET", status_code=500)
+            return [["2025-01-29T09:15:00", 100, 101, 99, 100, 10, 10]]
+
+    result = await sync_research_data(
+        PartialArchiveClient(), factory, ["NIFTY"], trading_day, trading_day,
+        include_options=True,
+    )
+
+    assert result.option_candles == 1
+    assert any("1 historical contracts could not be downloaded" in reason for reason in result.incomplete_reasons)
+    assert any("30Jan25-25000-CE failed" in warning for warning in result.warnings)
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(Candle).where(Candle.data_role == "OPTION")) == 1
+    engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_historical_download_splits_range_after_groww_timeout(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'timeout.db'}")
     Base.metadata.create_all(engine)
